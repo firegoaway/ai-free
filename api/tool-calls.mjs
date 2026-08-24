@@ -82,7 +82,16 @@ function extractToolCallsBlock(source) {
 }
 
 function parseCallsJson(jsonStr) {
-  const attempts = [jsonStr, escapeUnescapedInnerQuotes(jsonStr)];
+  // Серия ремонтов деградированного JSON (2026-08-24): пропавший ключ
+  // "arguments" + неэкранированные внутренние кавычки. Комбинируем
+  // стратегии, дедуплицируем, пробуем по порядку.
+  const attempts = [...new Set([
+    jsonStr,
+    repairMissingArgumentsKey(jsonStr),
+    escapeUnescapedInnerQuotes(jsonStr),
+    repairMissingArgumentsKey(escapeUnescapedInnerQuotes(jsonStr)),
+    escapeUnescapedInnerQuotes(repairMissingArgumentsKey(jsonStr)),
+  ])];
   for (const attempt of attempts) {
     try {
       const parsed = JSON.parse(attempt);
@@ -135,6 +144,25 @@ export function repairTruncatedToolCallJson(jsonStr) {
   } catch {
     return String(jsonStr || "");
   }
+}
+
+// Ремонт деградированного Qwen-вывода: модель роняет ключ "arguments" и
+// вставляет объект аргументов сразу после имени:
+//   {"name": "read_file", {"path": "..."}}   (невалидный JSON)
+// вместо
+//   {"name": "read_file", "arguments": {"path": "..."}}
+// Эвристика: {"name": "...", { → вставляем "arguments": перед второй "{".
+// Ограничиваем матч именами тулов (безопасно для прозы со сложными скобками).
+export function repairMissingArgumentsKey(jsonStr) {
+  const s = String(jsonStr || "");
+  try {
+    JSON.parse(s);
+    return s;
+  } catch { /* repair below */ }
+  return s.replace(
+    /("name"\s*:\s*"[^"]+"\s*,\s*)(\{\s*\n?\s*")/g,
+    '$1"arguments": $2',
+  );
 }
 
 // Ремонт неэкранированных двойных кавычек внутри JSON-строк.
@@ -232,7 +260,12 @@ export function extractBareToolCallsArray(text) {
       // Обрезанный объект — пробуем ремонт.
       candidate = repairTruncatedToolCallJson(source.slice(braceStart));
     }
-    const attempts = [candidate, repairTruncatedToolCallJson(candidate)];
+    const attempts = [
+      candidate,
+      repairMissingArgumentsKey(candidate),
+      repairTruncatedToolCallJson(candidate),
+      repairTruncatedToolCallJson(repairMissingArgumentsKey(candidate)),
+    ];
     for (const attempt of attempts) {
       try {
         const obj = JSON.parse(attempt);
@@ -263,11 +296,20 @@ export function extractBareToolCalls(text, { allowedNames } = {}) {
     if (end === -1) continue;
 
     let parsed;
-    try {
-      parsed = JSON.parse(source.slice(start, end + 1));
-    } catch {
-      continue;
+    const rawCandidate = source.slice(start, end + 1);
+    const candidates = [...new Set([
+      rawCandidate,
+      repairMissingArgumentsKey(rawCandidate),
+      escapeUnescapedInnerQuotes(rawCandidate),
+      repairMissingArgumentsKey(escapeUnescapedInnerQuotes(rawCandidate)),
+    ])];
+    for (const candidate of candidates) {
+      try {
+        parsed = JSON.parse(candidate);
+        break;
+      } catch { /* next candidate */ }
     }
+    if (!parsed) continue;
 
     const call = normalizeCall(parsed);
     const hasExplicitArguments = parsed && typeof parsed === "object"

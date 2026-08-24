@@ -49,6 +49,14 @@ export function throwIfQwenFirstContentTimeout(result) {
   throw error;
 }
 
+// Детект: стрим умер по first-content timeout (сервер принял POST, но не
+// отдал ни чанка за firstContentMs). Именно этот кейс kilocode видит как
+// EMPTY_UPSTREAM_STREAM после серии успешных tool calls.
+export function isQwenFirstContentTimeoutResult(result) {
+  return Number(result?.status) === 0
+    && /qwen_stream_first_content_timeout/i.test(String(result?.text || ""));
+}
+
 function throwIfQwenAuthFailure(status, text, context) {
   try {
     throwIfQwenSessionExpiredFromHttp(status, text, context);
@@ -510,6 +518,24 @@ export class QwenChatClient {
             })
             : await proxy.proxyFetch({ url, body: bodyStr, chatId });
 
+          // First-content timeout (2026-08-24, kilocode): сервер принял POST,
+          // но молчит дольше firstContentMs. Генерация на сервере часто жива —
+          // сначала harvest истории, ошибка только если и там пусто.
+          if (isQwenFirstContentTimeoutResult(result)) {
+            const harvested = await harvestAfterFirstContentTimeout({
+              result,
+              chatId,
+              onText,
+              getProxy: () => getQwenBrowserProxy({ debug: this.debug }),
+              debug: this.debug,
+            });
+            if (harvested.recovered) {
+              return {
+                result: finalizeQwenCompletionResult(harvested.recovered, "", "completion (browser, first-content harvest)"),
+                chatInProgressStuck: false,
+              };
+            }
+          }
           throwIfQwenFirstContentTimeout(result);
           // Прокси пометил ответ как Baxia punish (антибот-капча) —
           // кулдаун уже включён в прокси, наверх уходит понятная ошибка.
@@ -1115,6 +1141,42 @@ export function streamHarvestTail({ harvestedText, streamedText, onText }) {
   if (!streamed) {
     onText(saved);
   }
+}
+
+// First-content timeout (2026-08-24, kilocode over npm run api): сервер
+// принял completion-POST, но не выдал ни чанка за firstContentMs (240s на
+// деградированных днях). При этом генерация на сервере ЧАСТО ПРОДОЛЖАЕТСЯ —
+// инцидент 2026-08-21 доказал, что ответ сохраняется в истории чата.
+// Вместо мгновенного EMPTY_UPSTREAM_STREAM — пробуем harvest истории;
+// если сервер так и не родил контент, ошибка уходит наверх как раньше.
+export async function harvestAfterFirstContentTimeout({
+  result,
+  chatId,
+  onText = null,
+  getProxy,
+  pollMs,
+  timeoutMs,
+  debug = false,
+}) {
+  if (!isQwenFirstContentTimeoutResult(result)) {
+    return { applicable: false };
+  }
+  const recovered = await harvestTransportFailedCompletion({
+    chatId,
+    streamedText: "",
+    onText,
+    getProxy,
+    pollMs,
+    timeoutMs,
+    debug,
+  });
+  if (!recovered) return { applicable: true, recovered: null };
+  providerLogger.warn("provider.qwen.stream_resume", {
+    operation: "first_content_timeout_harvest",
+    chatId,
+    chars: recovered.text?.length || 0,
+  });
+  return { applicable: true, recovered };
 }
 
 function findQwenErrorInSseText(text) {
