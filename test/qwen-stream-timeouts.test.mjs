@@ -8,7 +8,7 @@ describe("Qwen stream timeouts", () => {
 
     assert.equal(timeouts.fetchMs, 600_000);
     assert.equal(timeouts.firstContentMs, 240_000);
-    assert.equal(timeouts.idleMs, 90_000);
+    assert.equal(timeouts.idleMs, 360_000);
   });
 
   it("keeps explicit environment overrides", () => {
