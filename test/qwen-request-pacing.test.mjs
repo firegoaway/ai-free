@@ -3,12 +3,14 @@ import { describe, it, beforeEach } from "node:test";
 import {
   QWEN_ANTIBOT_PUNISH,
   assertNoQwenAntibotCooldown,
+  clearQwenPunishCooldown,
   createQwenPunishError,
   isQwenPunishResponse,
   getQwenAntibotCooldownRemaining,
   qwenAntibotCooldownRemainingMs,
   recordQwenStreamOutcome,
   startQwenPunishCooldown,
+  startQwenPoolPunishCooldown,
   registerQwenPunish,
   registerQwenCompletionSuccess,
   resetQwenPacingStateForTests,
@@ -169,5 +171,83 @@ describe("pacing: минимальный интервал между POST /compl
       assert.ok(minIntervalMs >= 1_000 && minIntervalMs <= 5_000);
       assert.ok(punishCooldownMs >= 30_000);
     });
+  });
+});
+
+describe("������� per-account (������� ����)", () => {
+  beforeEach(() => {
+    resetQwenPacingStateForTests();
+  });
+
+  it("punish �� ����� �������� �� ��������� ������", () => {
+    const now = Date.now();
+    startQwenPunishCooldown(now, "acc1");
+    assert.ok(qwenAntibotCooldownRemainingMs(now, "acc1") > 0);
+    assert.equal(qwenAntibotCooldownRemainingMs(now, "acc2"), 0);
+    assert.equal(assertNoQwenAntibotCooldown(now, "acc2"), false);
+    assert.throws(() => assertNoQwenAntibotCooldown(now, "acc1"), (e) => e.code === QWEN_ANTIBOT_PUNISH);
+  });
+
+  it("����� ���������� ������� ������ ������ ��������", () => {
+    const now = Date.now();
+    startQwenPunishCooldown(now, "acc1");
+    startQwenPunishCooldown(now, "acc2");
+    registerQwenCompletionSuccess(now + 1000, "acc1");
+    assert.equal(qwenAntibotCooldownRemainingMs(now + 1000, "acc1"), 0);
+    assert.ok(qwenAntibotCooldownRemainingMs(now + 1000, "acc2") > 0);
+  });
+
+  it("clearQwenPunishCooldown ������ �������, ��� ��������� � ���", () => {
+    const now = Date.now();
+    startQwenPunishCooldown(now, "acc1");
+    startQwenPunishCooldown(now, "acc2");
+    clearQwenPunishCooldown("acc1");
+    assert.equal(qwenAntibotCooldownRemainingMs(now, "acc1"), 0);
+    assert.ok(qwenAntibotCooldownRemainingMs(now, "acc2") > 0);
+    clearQwenPunishCooldown();
+    assert.equal(qwenAntibotCooldownRemainingMs(now, "acc2"), 0);
+  });
+
+  it("waitForQwenCompletionSlot ��������� ������� ���������� ��������", async () => {
+    const now = Date.now();
+    startQwenPunishCooldown(now, "acc1");
+    await assert.rejects(
+      () => waitForQwenCompletionSlot({ now, sleep: async () => {}, accountId: "acc1" }),
+      (e) => e.code === QWEN_ANTIBOT_PUNISH,
+    );
+    // ������������ ������� �������� ��� �������� (�������� 0 ����� env).
+    process.env.QWEN_COMPLETION_MIN_INTERVAL_MS = "0";
+    try {
+      const waited = await waitForQwenCompletionSlot({ now, sleep: async () => {}, accountId: "acc2" });
+      assert.equal(waited, 0);
+    } finally {
+      delete process.env.QWEN_COMPLETION_MIN_INTERVAL_MS;
+    }
+  });
+});
+
+describe("пулевый кулдаун (IP-punish breaker)", () => {
+  beforeEach(() => {
+    resetQwenPacingStateForTests();
+  });
+
+  it("блокирует ВСЕ аккаунты, per-account clear его не снимает", () => {
+    const now = Date.now();
+    const ms = startQwenPoolPunishCooldown(now);
+    assert.ok(ms > 0);
+    assert.ok(qwenAntibotCooldownRemainingMs(now, "accX") > 0);
+    assert.ok(qwenAntibotCooldownRemainingMs(now, "accY") > 0);
+    assert.ok(qwenAntibotCooldownRemainingMs(now, "default") > 0);
+    clearQwenPunishCooldown("accX");
+    assert.ok(qwenAntibotCooldownRemainingMs(now, "accX") > 0, "пул всё ещё активен");
+    clearQwenPunishCooldown();
+    assert.equal(qwenAntibotCooldownRemainingMs(now, "accX"), 0);
+  });
+
+  it("успех одного аккаунта не снимает пулевую блокировку", () => {
+    const now = Date.now();
+    startQwenPoolPunishCooldown(now);
+    registerQwenCompletionSuccess(now + 1000, "acc1");
+    assert.ok(qwenAntibotCooldownRemainingMs(now + 1000, "acc1") > 0);
   });
 });

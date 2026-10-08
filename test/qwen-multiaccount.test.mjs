@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import {
   addAccount, loadAccounts, getAvailableAccount, markRateLimited, markInvalid,
   markValid, hasAvailableAccounts, formatAccountStatus, removeAccount, getAccountById as getAccountByIdPublic,
-  getAccountProfileDir,
+  getAccountProfileDir, markAccountCooldown,
 } from "../src/providers/qwen/account-store.mjs";
 
 // Хранилище указывает на реальный ~/.qwen-cli/accounts.json — тесты работают
@@ -44,10 +44,25 @@ describe("qwen multiaccount account-store", () => {
     const rl = statuses.find((a) => a.id === mk(3));
     assert.ok(rl.resetAt, "resetAt должен быть установлен");
     assert.equal(formatAccountStatus(rl).code, 1); // WAIT
-    assert.match(formatAccountStatus(rl).label, /Ожидание сброса/);
+    assert.match(formatAccountStatus(rl).label, /Кулдаун/);
     const okAcc = statuses.find((a) => a.id === mk(4));
     assert.equal(formatAccountStatus(okAcc).code, 2); // OK
     removeAccount(mk(3)); removeAccount(mk(4));
+  });
+
+  it("markAccountCooldown выводит аккаунт из ротации на минуты (Baxia punish)", () => {
+    addAccount({ id: mk(6), token: "jwt-6" });
+    markAccountCooldown(mk(6), 90_000);
+    // Пока кулдаун активен — аккаунт недоступен для ротации.
+    assert.equal(getAccountByIdPublic(mk(6)), null);
+    const saved = loadAccounts().find((a) => a.id === mk(6));
+    const remaining = new Date(saved.resetAt).getTime() - Date.now();
+    assert.ok(remaining > 60_000 && remaining <= 90_000, `ожидание ~90с, получено ${remaining}мс`);
+    assert.equal(formatAccountStatus(saved).code, 1); // WAIT
+    // Некорректные аргументы не должны трогать хранилище.
+    markAccountCooldown(null, 60_000);
+    markAccountCooldown(mk(6), 0);
+    removeAccount(mk(6));
   });
 
   it("markInvalid drops account; markValid restores it", () => {

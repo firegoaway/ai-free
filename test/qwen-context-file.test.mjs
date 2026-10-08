@@ -3,8 +3,10 @@ import { describe, it } from "node:test";
 import {
   resolveQwenContextFileConfig,
   splitPromptForFileUpload,
-  buildQwenFileAttachment,
+  splitFileTextForOverflow,
   uploadQwenContextFile,
+  uploadQwenContextFiles,
+  buildQwenFileAttachment,
 } from "../src/providers/qwen/context-file.mjs";
 import { buildQwenCompletionPayload } from "../src/providers/qwen/completion-payload.mjs";
 import { formatQwenStreamError } from "../src/providers/qwen/client.mjs";
@@ -218,7 +220,7 @@ describe("qwen completion payload files", () => {
 describe("qwen punish stub error formatting", () => {
   it("recognizes the RGV587 anti-bot stub returned for oversized prompts", () => {
     const stub = {
-      ret: ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试"],
+      ret: ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稝坎針试"],
       data: {
         url: "https://chat.qwen.ai:443//api/v2/chat/completions/_____tmd_____/punish?x5secdata=abc&x5step=2&action=captcha&pureCaptcha=",
       },
@@ -231,5 +233,91 @@ describe("qwen punish stub error formatting", () => {
 
   it("still ignores normal payloads without ret/punish markers", () => {
     assert.equal(formatQwenStreamError({ data: { url: "https://example.com/ok" } }), null);
+  });
+});
+
+describe("qwen context-file overflow (мульти-файл)", () => {
+  const cfg = (patch = {}) => ({
+    thresholdChars: 100,
+    inlineChars: 50,
+    maxFileChars: 500_000,
+    ...patch,
+  });
+
+  it("splitFileTextForOverflow: ниже потолка — одна часть", () => {
+    const parts = splitFileTextForOverflow("a".repeat(1000), 500_000);
+    assert.equal(parts.length, 1);
+    assert.equal(parts[0].length, 1000);
+  });
+
+  it("упаковывает целые сегменты, излишек — во вторую часть", () => {
+    const seg = (n) => `SEG${n} ` + "x".repeat(400);
+    const text = [seg(1), seg(2), seg(3)].join("\n\n---\n\n");
+    const parts = splitFileTextForOverflow(text, 1000);
+    assert.equal(parts.length, 2);
+    assert.ok(parts[0].includes("SEG1") && parts[0].includes("SEG2"));
+    assert.ok(!parts[0].includes("SEG3"));
+    assert.ok(parts[1].includes("SEG3"));
+    assert.equal(parts.join("\n\n---\n\n"), text, "сборка без потерь");
+  });
+
+  it("гигантский сегмент жёстко режется на куски по потолку", () => {
+    const parts = splitFileTextForOverflow("y".repeat(2500), 1000);
+    assert.equal(parts.length, 3);
+    assert.deepEqual(parts.map((p) => p.length), [1000, 1000, 500]);
+  });
+
+  it("пустой текст — ноль частей", () => {
+    assert.deepEqual(splitFileTextForOverflow("", 100), []);
+    assert.deepEqual(splitFileTextForOverflow("   \n ", 100), []);
+  });
+
+  it("splitPromptForFileUpload возвращает fileParts и упоминает число файлов", () => {
+    const head = "[TOOL INSTRUCTIONS] head";
+    const seg = (n) => `MSG${n} ` + "z".repeat(120);
+    const prompt = [head, seg(1), seg(2), seg(3)].join("\n\n---\n\n");
+    const split = splitPromptForFileUpload(prompt, cfg({ thresholdChars: 300, inlineChars: 150, maxFileChars: 200 }));
+    assert.ok(split.fileParts.length >= 2, "ожидались минимум 2 части");
+    assert.equal(split.fileParts.join("\n\n---\n\n"), split.fileText);
+    const noteMatch = split.inline.match(/(\d+) текстовых файл/);
+    assert.ok(noteMatch, "заметка должна упоминать число файлов");
+    assert.equal(Number(noteMatch[1]), split.fileParts.length);
+  });
+
+  it("uploadQwenContextFiles загружает части последовательно с нумерацией", async () => {
+    const calls = [];
+    const proxyApiPost = async (path, body) => {
+      calls.push(path);
+      if (path === "/api/v2/files/getstsToken") {
+        const n = calls.filter((c) => c === "/api/v2/files/getstsToken").length;
+        return {
+          ok: true, status: 200,
+          json: { data: {
+            access_key_id: "ak", access_key_secret: "sk", security_token: "st",
+            bucketname: "b", region: "r", endpoint: "https://oss.example",
+            file_id: "fid_" + n,
+            file_path: "u1/f" + n + ".txt",
+            file_url: "https://oss.example/u1/f.txt",
+          } },
+        };
+      }
+      if (path === "/api/v2/files/parse/status") {
+        return { ok: true, status: 200, json: { data: [{ status: "success" }] } };
+      }
+      return { ok: true, status: 200, json: {} };
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const attachments = await uploadQwenContextFiles({
+      proxyApiPost,
+      fetchImpl,
+      parts: ["часть один", "часть два", "часть три"],
+      now: () => 1_700_000_000_000,
+    });
+    assert.equal(attachments.length, 3);
+    assert.equal(attachments[0].name, "Pasted_Text_1700000000000.txt");
+    assert.equal(attachments[1].name, "Pasted_Text_1700000000000_2.txt");
+    assert.equal(attachments[2].name, "Pasted_Text_1700000000000_3.txt");
+    assert.equal(calls.filter((c) => c === "/api/v2/files/getstsToken").length, 3);
+    assert.equal(attachments[0].file_class, "default");
   });
 });

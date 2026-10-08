@@ -29,7 +29,7 @@ import {
 } from "./session-errors.mjs";
 import { getQwenBrowserProxy, resetQwenBrowserProxy } from "./browser-proxy.mjs";
 import { buildQwenCompletionPayload } from "./completion-payload.mjs";
-import { resolveQwenContextFileConfig, splitPromptForFileUpload, uploadQwenContextFile } from "./context-file.mjs";
+import { contextFileConfigForRequest, resolveQwenContextFileConfig, splitPromptForFileUpload, uploadQwenContextFiles } from "./context-file.mjs";
 import { harvestQwenChatMessage, harvestTransportFailedCompletion } from "./harvest.mjs";
 import { waitForQwenCompletionSlot, createQwenPunishError, qwenAntibotCooldownRemainingMs } from "./request-pacing.mjs";
 import { createFileLogger } from "../../logging/logger.mjs";
@@ -262,6 +262,10 @@ export class QwenChatClient {
     // Интерактивный чат по умолчанию НЕ включает авто-режим (одно восстановление
     // + читаемое сообщение пользователю), чтобы не висеть долго в UI.
     autoRetry = false,
+    // 2026-09-30 «depth 47+ пустые стримы»: при повторе после пустого стрима
+    // принудительно переносим историю в context-файл — реальный предел Qwen
+    // плавает ниже thresholdChars, сплит по факту ошибки спасает запрос.
+    forceContextFile = false,
   }) {
     const startedAt = Date.now();
     providerLogger.info("provider.qwen.request", {
@@ -276,7 +280,7 @@ export class QwenChatClient {
     try {
       const result = await this.#completeWithRecovery({
         chatId, prompt, parentId, thinking, search, onText, onThinking, model,
-        allowNewChatRecovery, autoRetry,
+        allowNewChatRecovery, autoRetry, forceContextFile,
       });
       providerLogger.info("provider.qwen.success", {
         operation: "completion",
@@ -317,6 +321,7 @@ export class QwenChatClient {
     model,
     allowNewChatRecovery,
     autoRetry,
+    forceContextFile = false,
   }) {
     const round = await this.#completionRound({
       chatId,
@@ -327,6 +332,7 @@ export class QwenChatClient {
       onText,
       onThinking,
       model,
+      forceContextFile,
     });
 
     // Успех — отдаём как есть. Оба состояния ниже означают, что сохранённая
@@ -431,13 +437,17 @@ export class QwenChatClient {
     onText,
     onThinking,
     model,
+    forceContextFile = false,
   }) {
     // Большой промпт → файл-вложение context.txt (аналог вставки большого
     // текста в поле ввода веб-интерфейса). Антибот Qwen при промпте свыше
     // ~118k символов молча возвращает punish-заглушку вместо ответа.
     let promptToUse = String(prompt || "");
     let contextFiles = null;
-    const contextFileConfig = resolveQwenContextFileConfig();
+    const contextFileConfig = contextFileConfigForRequest(resolveQwenContextFileConfig(), {
+      force: forceContextFile,
+      promptLength: promptToUse.length,
+    });
     const split = splitPromptForFileUpload(promptToUse, contextFileConfig);
     if (split) {
       const proxy = await getQwenBrowserProxy({ accountId: this.accountId, debug: this.debug });
@@ -445,15 +455,18 @@ export class QwenChatClient {
         operation: "upload",
         fileChars: split.fileChars,
         inlineChars: split.inlineChars,
+        parts: split.fileParts.length,
       });
-      const attachment = await uploadQwenContextFile({
+      // Мульти-файл «переливом»: первый txt до QWEN_CONTEXT_FILE_MAX_CHARS,
+      // излишек — в _2, _3… Порядок частей = порядок истории.
+      const attachments = await uploadQwenContextFiles({
         proxyApiPost: (path, apiBody) => proxy.proxyApiPost({ path, body: apiBody, chatId }),
-        content: split.fileText,
+        parts: split.fileParts,
       });
       promptToUse = split.inline;
-      contextFiles = [attachment];
+      contextFiles = attachments;
       if (this.debug) {
-        console.log(`[qwen] context moved to file: ${split.fileChars} chars → ${attachment.name} (${attachment.id}); inline left: ${split.inlineChars}`);
+        console.log(`[qwen] context moved to ${attachments.length} file(s): ${split.fileChars} chars total; inline left: ${split.inlineChars}`);
       }
     }
 
@@ -504,7 +517,7 @@ export class QwenChatClient {
           // Pacing: минимальный интервал между POST /completions, чтобы не
           // разгонять риск-скоринг Baxia. Также кидает QWEN_ANTIBOT_PUNISH,
           // если активен кулдаун после детектированной punish-страницы.
-          const pacingWaitMs = await waitForQwenCompletionSlot();
+          const pacingWaitMs = await waitForQwenCompletionSlot({ accountId: this.accountId });
           if (pacingWaitMs > 0 && this.debug) {
             console.log(`[qwen] pacing: waited ${pacingWaitMs}ms before completion`);
           }
@@ -541,7 +554,7 @@ export class QwenChatClient {
           // Прокси пометил ответ как Baxia punish (антибот-капча) —
           // кулдаун уже включён в прокси, наверх уходит понятная ошибка.
           if (result.punish) {
-            throw createQwenPunishError(qwenAntibotCooldownRemainingMs());
+            throw createQwenPunishError(qwenAntibotCooldownRemainingMs(Date.now(), this.accountId));
           }
 
           // Стрим оборвался без терминального маркера (текст шёл, потом

@@ -75,18 +75,48 @@ export function createQwenPunishError(cooldownMs) {
 }
 
 // --- cooldown state -------------------------------------------------------
+//
+// Состояние PER-ACCOUNT: Baxia карает браузерный профиль аккаунта (у каждого
+// свой browser-profile-N), а не пул целиком. Глобальный лок лочил все
+// аккаунты сразу и убивал ротацию: punish на одном аккаунте мгновенно валил
+// запросы ко всем остальным (инцидент 2026-09-15: 600s -> 1200s эскалация).
+// lastCompletionAt остаётся глобальным: сериализация POST-ов пула снижает
+// риск-скоринг.
 
-let punishUntil = 0;
-let punishStreak = 0;
+const accountPacing = new Map(); // accountId -> { punishUntil, punishStreak, emptyStreak }
 let lastCompletionAt = 0;
-let emptyStreak = 0;
+// Пулевая блокировка (IP-level punish): когда Baxia карает НЕ профиль, а
+// IP/браузер целиком, ротация только разгоняет шторм — каждый свитч = новый
+// запрос в активный punish (+600s аккаунту, эскалация до 1800s). Второй
+// подряд punish на разных аккаунтах включает общий кулдаун на весь пул.
+let poolPunishUntil = 0;
+
+function pacingStateFor(accountId = "default") {
+  let state = accountPacing.get(accountId);
+  if (!state) {
+    state = { punishUntil: 0, punishStreak: 0, emptyStreak: 0 };
+    accountPacing.set(accountId, state);
+  }
+  return state;
+}
 
 /** Сброс состояния (только для тестов). */
 export function resetQwenPacingStateForTests() {
-  punishUntil = 0;
-  punishStreak = 0;
+  accountPacing.clear();
   lastCompletionAt = 0;
-  emptyStreak = 0;
+  poolPunishUntil = 0;
+}
+
+/**
+ * Включить пулевую блокировку всех аккаунтов (IP-punish breaker).
+ * Длительность QWEN_POOL_PUNISH_COOLDOWN_MS (по умолчанию 300с — короче
+ * индивидуальных 600с, чтобы хвостом управляли per-account кулдауны).
+ * @returns {number} длительность мс.
+ */
+export function startQwenPoolPunishCooldown(now = Date.now()) {
+  const ms = numEnv("QWEN_POOL_PUNISH_COOLDOWN_MS", 300_000);
+  poolPunishUntil = Math.max(poolPunishUntil, now + ms);
+  return ms;
 }
 
 function resolvePunishCooldownMs() {
@@ -101,11 +131,11 @@ function resolvePunishCooldownMaxMs() {
 }
 
 /**
- * Активен ли антибот-кулдаун.
+ * Активен ли антибот-кулдаун аккаунта.
  * @returns {number} остаток мс или 0.
  */
-export function qwenAntibotCooldownRemainingMs(now = Date.now()) {
-  return Math.max(0, punishUntil - now);
+export function qwenAntibotCooldownRemainingMs(now = Date.now(), accountId = "default") {
+  return Math.max(poolPunishUntil - now, pacingStateFor(accountId).punishUntil - now, 0);
 }
 
 // Совместимые алиасы.
@@ -113,60 +143,78 @@ export const getQwenAntibotCooldownRemaining = qwenAntibotCooldownRemainingMs;
 export const registerQwenPunish = startQwenPunishCooldown;
 
 /**
- * Бросить, если антибот-кулдаун активен.
+ * Бросить, если антибот-кулдаун аккаунта активен.
  * @returns {boolean} false если кулдаун не активен.
  * @throws {Error} с code=QWEN_ANTIBOT_PUNISH и cooldownRemainingMs.
  */
-export function assertNoQwenAntibotCooldown(now = Date.now()) {
-  const remaining = qwenAntibotCooldownRemainingMs(now);
+export function assertNoQwenAntibotCooldown(now = Date.now(), accountId = "default") {
+  const remaining = qwenAntibotCooldownRemainingMs(now, accountId);
   if (remaining <= 0) return false;
   const err = createQwenPunishError(remaining);
   err.cooldownRemainingMs = remaining;
   throw err;
 }
 
-// Зарегистрировать punish: экспоненциальный бэкофф с потолком.
-export function startQwenPunishCooldown(now = Date.now()) {
+// Зарегистрировать punish: экспоненциальный бэкофф с потолком (per-account).
+export function startQwenPunishCooldown(now = Date.now(), accountId = "default") {
+  const state = pacingStateFor(accountId);
   const base = resolvePunishCooldownMs();
   const cap = Math.max(resolvePunishCooldownMaxMs(), base);
-  punishStreak += 1;
-  const backoffMs = Math.min(base * 2 ** (punishStreak - 1), cap);
-  punishUntil = Math.max(punishUntil, now + backoffMs);
-  emptyStreak = 0;
-  return { punishStreak, backoffMs };
+  state.punishStreak += 1;
+  const backoffMs = Math.min(base * 2 ** (state.punishStreak - 1), cap);
+  state.punishUntil = Math.max(state.punishUntil, now + backoffMs);
+  state.emptyStreak = 0;
+  return { punishStreak: state.punishStreak, backoffMs };
 }
 
-/** Успешный ответ: сбросить streak-и и снять кулдаун. */
-export function registerQwenCompletionSuccess(now = Date.now()) {
-  punishStreak = 0;
-  emptyStreak = 0;
-  if (punishUntil > now) punishUntil = now;
+/** Успешный ответ: сбросить streak-и и снять кулдаун аккаунта. */
+export function registerQwenCompletionSuccess(now = Date.now(), accountId = "default") {
+  const state = pacingStateFor(accountId);
+  state.punishStreak = 0;
+  state.emptyStreak = 0;
+  if (state.punishUntil > now) state.punishUntil = now;
 }
 
-/** Солвер капчи решил punish: немедленно снять кулдаун. */
-export function clearQwenPunishCooldown() {
-  punishStreak = 0;
-  emptyStreak = 0;
-  punishUntil = 0;
+/**
+ * Солвер капчи решил punish: снять кулдаун. Без accountId — все аккаунты
+ * (ручное решение капчи в окне исторически чистило глобально).
+ */
+export function clearQwenPunishCooldown(accountId = null) {
+  if (accountId == null) {
+    for (const state of accountPacing.values()) {
+      state.punishStreak = 0;
+      state.emptyStreak = 0;
+      state.punishUntil = 0;
+    }
+    poolPunishUntil = 0;
+    return;
+  }
+  const state = accountPacing.get(accountId);
+  if (!state) return;
+  state.punishStreak = 0;
+  state.emptyStreak = 0;
+  state.punishUntil = 0;
 }
 
 // --- empty-stream backoff ---------------------------------------------------
 
 /**
- * Зафиксировать результат стрима. Пустые стримы подряд наращивают счётчик;
- * при достижении порога включается короткий кулдаун, счётчик сбрасывается.
+ * Зафиксировать результат стрима аккаунта. Пустые стримы подряд наращивают
+ * счётчик; при достижении порога включается короткий кулдаун аккаунта,
+ * счётчик сбрасывается.
  */
-export function recordQwenStreamOutcome(wasEmpty, now = Date.now()) {
+export function recordQwenStreamOutcome(wasEmpty, now = Date.now(), accountId = "default") {
+  const state = pacingStateFor(accountId);
   if (wasEmpty) {
-    emptyStreak += 1;
-    if (emptyStreak >= emptyStreakThreshold()) {
+    state.emptyStreak += 1;
+    if (state.emptyStreak >= emptyStreakThreshold()) {
       const backoff = resolveEmptyBackoffMs();
-      punishUntil = Math.max(punishUntil, now + backoff);
-      emptyStreak = 0;
+      state.punishUntil = Math.max(state.punishUntil, now + backoff);
+      state.emptyStreak = 0;
     }
     return;
   }
-  registerQwenCompletionSuccess(now);
+  registerQwenCompletionSuccess(now, accountId);
 }
 
 function emptyStreakThreshold() {
@@ -188,9 +236,9 @@ export function getQwenEmptyStreak() {
  * Дождаться слота для POST /completions: если предыдущий запрос был меньше
  * чем QWEN_COMPLETION_MIN_INTERVAL_MS назад — спим остаток. Слот
  * резервируется сразу (на момент освобождения), чтобы параллельные вызовы
- * сериализовались.
+ * сериализовались. Кулдаун-проверка — per-account (inject.accountId).
  *
- * @param {{now?:()=>number, sleep?:(ms:number)=>Promise<void>}} [inject]
+ * @param {{now?:()|number, sleep?:(ms:number)=>Promise<void>, accountId?:string}} [inject]
  * @returns {Promise<number>} сколько фактически ждали (мс).
  */
 export async function waitForQwenCompletionSlot(inject = {}) {
@@ -204,7 +252,7 @@ export async function waitForQwenCompletionSlot(inject = {}) {
         : () => Date.now();
   const sleep = inject.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
 
-  await assertNoQwenAntibotCooldown(nowFn());
+  await assertNoQwenAntibotCooldown(nowFn(), inject.accountId);
 
   const minInterval = numEnv(
     "QWEN_COMPLETION_MIN_INTERVAL_MS",

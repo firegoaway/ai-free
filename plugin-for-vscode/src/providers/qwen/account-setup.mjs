@@ -9,7 +9,7 @@ import readline from "node:readline";
 import { QWEN_HOME, QWEN_AUTH_FILE, QWEN_BROWSER_PROFILE } from "./config.mjs";
 import {
   loadAccounts, addAccount, removeAccount, markValid,
-  formatAccountStatus, getAccountProfileDir,
+  formatAccountStatus, getAccountProfileDir, setAccountLabel,
 } from "./account-store.mjs";
 
 function prompt(question) {
@@ -29,7 +29,8 @@ function printAccounts(accounts) {
   }
   accounts.forEach((account, index) => {
     const status = formatAccountStatus(account);
-    console.log(`${String(index + 1).padStart(2, " ")} | ${account.id} | ${status.label}`);
+    const label = account.label ? ` | ${account.label}` : "";
+    console.log(`${String(index + 1).padStart(2, " ")} | ${account.id}${label} | ${status.label}`);
   });
 }
 
@@ -54,6 +55,11 @@ export async function addAccountInteractive() {
   const { loginQwenAndSave } = await import("./browser-login.mjs");
   const loginResult = await loginQwenAndSave(authFile, { profileDir });
 
+  // Метка слота — почта, которой залогинились. Спрашиваем ПОСЛЕ логина:
+  // пользователь только что видел её в окне (инцидент 2026-09-25: по
+  // acc_<timestamp> невозможно вспомнить, какая почта в каком слоте).
+  const label = await prompt(`Почта этого аккаунта для метки (Enter = без метки): `);
+
   addAccount({
     id,
     token: loginResult.token,
@@ -61,6 +67,7 @@ export async function addAccountInteractive() {
     cookieHeader: loginResult.cookieHeader,
     userId: loginResult.userId,
     profileDir,
+    ...(label ? { label } : {}),
   });
 
   const total = loadAccounts().length;
@@ -80,7 +87,10 @@ export async function reloginAccountInteractive() {
   }
 
   console.log("\nАккаунты с истекшим токеном:");
-  invalids.forEach((a, idx) => console.log(`${idx + 1} - ${a.id}`));
+  invalids.forEach((a, idx) => {
+    const label = a.label ? ` (${a.label})` : "";
+    console.log(`${idx + 1} - ${a.id}${label}`);
+  });
   const choice = await prompt("Выберите номер аккаунта для повторного входа: ");
   const num = parseInt(choice, 10);
   if (isNaN(num) || num < 1 || num > invalids.length) {
@@ -90,7 +100,7 @@ export async function reloginAccountInteractive() {
   const account = invalids[num - 1];
 
   printDivider();
-  console.log(`Повторная авторизация для ${account.id}`);
+  console.log(`Повторная авторизация для ${account.id}${account.label ? ` (${account.label})` : ""}`);
   printDivider();
   const profileDir = account.profileDir || getAccountProfileDir(account.id);
   const authFile = path.join(profileDir, "auth.json");
@@ -102,6 +112,10 @@ export async function reloginAccountInteractive() {
     cookieHeader: result.cookieHeader,
     userId: result.userId,
   });
+  // Обновляем метку: перелогин могли сделать ДРУГОЙ почтой в тот же слот
+  // (инцидент 2026-09-25). Текущая показана — Enter оставляет как есть.
+  const newLabel = await prompt(`Почта для метки (сейчас: ${account.label || "нет"}; Enter = оставить): `);
+  if (newLabel) setAccountLabel(account.id, newLabel);
   console.log(`Токен обновлён для ${account.id}`);
 }
 

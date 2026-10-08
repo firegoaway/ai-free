@@ -26,16 +26,100 @@ import { createHmac, randomUUID } from "node:crypto";
 export const QWEN_CONTEXT_FILE_DEFAULTS = Object.freeze({
   thresholdChars: 100_000,
   inlineChars: 50_000,
+  maxFileChars: 500_000,
 });
 
 export function resolveQwenContextFileConfig(env = process.env) {
   return {
     thresholdChars: Number(env.QWEN_CONTEXT_FILE_THRESHOLD || QWEN_CONTEXT_FILE_DEFAULTS.thresholdChars),
     inlineChars: Number(env.QWEN_CONTEXT_FILE_INLINE_CHARS || QWEN_CONTEXT_FILE_DEFAULTS.inlineChars),
+    maxFileChars: Number(env.QWEN_CONTEXT_FILE_MAX_CHARS || QWEN_CONTEXT_FILE_DEFAULTS.maxFileChars),
   };
 }
 
+// Порог «большой промпт» для форса context-файла при пустом стриме. Ниже
+// этого объёма пустой стрим — почти наверняка антибот/сеть, а не размер.
+export const QWEN_CONTEXT_FILE_FORCE_MIN_CHARS = 30_000;
+
+// Конфиг для конкретного запроса. Инцидент 2026-09-30 «depth 47+ пустые
+// стримы»: Qwen молча отдаёт пустой стрим (200 OK без punish) на промптах
+// НИЖЕ thresholdChars — реальный предел плавающий. При force (пустой стрим
+// уже случился) и промпте от FORCE_MIN_CHARS — thresholdChars=0: сплит
+// сработает, история уедет файлом-вложением, инлайн останутся инструкции
+// инструментов + свежие сообщения.
+export function contextFileConfigForRequest(config, { force = false, promptLength = 0 } = {}) {
+  if (!force || !(promptLength >= QWEN_CONTEXT_FILE_FORCE_MIN_CHARS)) return config;
+  return { ...config, thresholdChars: 0 };
+}
+
 const SEGMENT_SEPARATOR = /\n\n---\n\n/;
+
+// Разбиение файловой части на части-«переливы»: первый txt заполняется до
+// maxFileChars, излишек — во второй, третий и т.д. Сегменты истории по
+// возможности остаются целыми (упаковка с конца границы), гигантский
+// одиночный сегмент жёстко режется по потолку.
+export function splitFileTextForOverflow(fileText, maxFileChars) {
+  const text = String(fileText || "");
+  if (!text.trim() || !(maxFileChars > 0)) return text.trim() ? [text] : [];
+  const cap = Math.floor(maxFileChars);
+
+  // Текст меньше потолка — один файл.
+  if (text.length <= cap) return [text];
+
+  const segments = text.split(SEGMENT_SEPARATOR);
+  // Нет разделителей — жёсткая нарезка по символам.
+  if (segments.length === 1) {
+    const parts = [];
+    for (let i = 0; i < text.length; i += cap) parts.push(text.slice(i, i + cap));
+    return parts;
+  }
+
+  const parts = [];
+  let current = [];
+  let currentLen = 0;
+  const flush = () => {
+    if (current.length) {
+      parts.push(current.join("\n\n---\n\n"));
+      current = [];
+      currentLen = 0;
+    }
+  };
+  for (const segment of segments) {
+    // Гигантский сегмент сам больше потолка: закрываем текущую часть и режем
+    // его кусков по cap.
+    if (segment.length > cap) {
+      flush();
+      let cut = 0;
+      while (cut < segment.length) {
+        parts.push(segment.slice(cut, cut + cap));
+        cut += cap;
+      }
+      continue;
+    }
+    const addLen = current.length ? SEGMENT_SEPARATOR.source.length + segment.length : segment.length;
+    if (currentLen + addLen > cap) flush();
+    current.push(segment);
+    currentLen += addLen;
+  }
+  flush();
+  return parts.filter((part) => part.trim());
+}
+
+// Заметка для инлайн-части: сколько файлов прикреплено и как их использовать.
+export function buildContextFileNote(fileChars, partCount) {
+  const filesLabel = partCount > 1
+    ? `${partCount} текстовых файла ("context.txt" части 1..${partCount} в порядке следования истории)`
+    : 'текстовый файл "context.txt"';
+  return (
+    `\n\n---\n[CONTEXT FILE]: Более ранняя часть этого разговора (${fileChars} символов) ` +
+    `прикреплена к сообщению как ${filesLabel} в списке вложений (files) — ` +
+    `Qwen мог переименовать их (например, в "e316e72a-..._Pasted_Text_....txt"): ` +
+    `ориентируйся на вложения, а не на имена файлов. ` +
+    `Прочитай их содержимое, уясни задачу и контекст диалога, изложи кратко замысел ` +
+    `(1–2 предложения) и продолжи работу со строгим соблюдением инструкций из вложений. ` +
+    `Не отвечай только на последнее сообщение — учитывай всю прикреплённую историю.`
+  );
+}
 
 // Разделяет промпт на инлайн-часть (инструкции инструментов + последние
 // сообщения + заметка о файле) и файловую часть (старая история диалога).
@@ -99,20 +183,15 @@ export function splitPromptForFileUpload(prompt, config = resolveQwenContextFile
   const fileText = fileSegments.join("\n\n---\n\n");
   if (!fileText.trim()) return null;
 
-  const note =
-    `\n\n---\n[CONTEXT FILE]: Более ранняя часть этого разговора (${fileText.length} символов) ` +
-    `прикреплена к сообщению как текстовый файл "context.txt" в списке вложений (files) — ` +
-    `Qwen мог переименовать его (например, в "e316e72a-..._Pasted_Text_....txt"): ` +
-    `ориентируйся на вложение, а не на имя файла. ` +
-    `Прочитай его содержимое, уясни задачу и контекст диалога, изложи кратко замысел ` +
-    `(1–2 предложения) и продолжи работу со строгим соблюдением инструкций из вложения. ` +
-    `Не отвечай только на последнее сообщение — учитывай всю прикреплённую историю.`;
+  const fileParts = splitFileTextForOverflow(fileText, config.maxFileChars);
+  const note = buildContextFileNote(fileText.length, fileParts.length);
 
   const inline = [head, ...inlineSegments].join("\n\n---\n\n") + note;
 
   return {
     inline,
     fileText,
+    fileParts,
     fileChars: fileText.length,
     inlineChars: inline.length,
   };
@@ -197,19 +276,20 @@ export async function uploadQwenContextFile({
   proxyApiPost,
   fetchImpl = fetch,
   content,
+  fileName = null,
   now = Date.now,
   pollTimeoutMs = 15_000,
   pollIntervalMs = 1_000,
 }) {
   const text = String(content || "");
   const buffer = Buffer.from(text, "utf8");
-  const fileName = `Pasted_Text_${now()}.txt`;
+  const finalName = fileName || `Pasted_Text_${now()}.txt`;
 
   // 1. STS-токен (filesize строкой — так шлёт веб-интерфейс).
   // proxyApiPost возвращает { ok, status, json } где json — УЖЕ распарсенное
   // тело (page.evaluate не переносит функции через границу Playwright).
   const stsRes = await proxyApiPost("/api/v2/files/getstsToken", {
-    filename: fileName,
+    filename: finalName,
     filesize: String(buffer.length),
     filetype: "file",
   });
@@ -261,5 +341,33 @@ export async function uploadQwenContextFile({
   }
 
   // 5. Объект вложения.
-  return buildQwenFileAttachment(sts, fileName, buffer.length);
+  return buildQwenFileAttachment(sts, finalName, buffer.length);
+}
+
+// Мульти-файловая загрузка «переливом»: части загружаются последовательно,
+// первая сохраняет веб-имя Pasted_Text_<ts>.txt, последующие нумеруются
+// _2, _3… — порядок в массиве соответствует порядку истории.
+export async function uploadQwenContextFiles({
+  proxyApiPost,
+  fetchImpl = fetch,
+  parts,
+  now = Date.now,
+  pollTimeoutMs = 15_000,
+  pollIntervalMs = 1_000,
+}) {
+  const attachments = [];
+  const ts = now();
+  for (let i = 0; i < parts.length; i += 1) {
+    const fileName = i === 0 ? `Pasted_Text_${ts}.txt` : `Pasted_Text_${ts}_${i + 1}.txt`;
+    attachments.push(await uploadQwenContextFile({
+      proxyApiPost,
+      fetchImpl,
+      content: parts[i],
+      fileName,
+      now,
+      pollTimeoutMs,
+      pollIntervalMs,
+    }));
+  }
+  return attachments;
 }

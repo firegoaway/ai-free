@@ -65,6 +65,28 @@ export async function run() {
     return;
   }
 
+  if (args.healthQwen) {
+    const { testQwenAccounts } = await import("../providers/qwen/account-health.mjs");
+    const { closeQwenBrowserProxy } = await import("../providers/qwen/browser-proxy.mjs");
+    console.log("Проверяю аккаунты Qwen (через прокси, с ожиданием минта)...");
+    let results;
+    try {
+      results = await testQwenAccounts();
+    } finally {
+      await closeQwenBrowserProxy(null);
+    }
+    console.log("\nРезультаты:");
+    const icons = { OK: "✅ OK", RATELIMIT: "⏳ Rate-limited", UNAUTHORIZED: "❌ Недействителен (нужен перелогин)" };
+    let alive = 0;
+    for (const r of results) {
+      const label = icons[r.verdict] || `⚠️ ${r.verdict}${r.reason ? `: ${r.reason}` : ""}`;
+      if (r.verdict === "OK" || r.verdict === "RATELIMIT") alive++;
+      console.log(`  ${r.id} | ${label}${r.hours ? ` (${r.hours}ч)` : ""}`);
+    }
+    console.log(`\nЖивых: ${alive} из ${results.length}`);
+    process.exit(0);
+  }
+
   if (args.importQwenFile) {
     const { importQwenFromJson } = await import("../providers/qwen/browser-login.mjs");
     await importQwenFromJson(path.resolve(args.importQwenFile));
