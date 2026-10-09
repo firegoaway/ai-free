@@ -63,7 +63,8 @@ function isQwenAuthErrorByMessage(error) {
 }
 
 function isQwenRateLimitError(error) {
-  return /rate.?limit|too many requests|429|quota/i.test(String(error?.message || ""));
+  const msg = String(error?.message || "");
+  return /rate.?limit|too many requests|429|quota|daily.?limit|free.?tier|guest.?chat.?limit|reached.?the.?(guest|daily|free)|out.?of.?limit|Вы достигли (дневного )?лимита|достигли лимита/i.test(msg);
 }
 
 // Часы cooldown из тела ошибки провайдера (FreeQwenAPI: errorBody.num).

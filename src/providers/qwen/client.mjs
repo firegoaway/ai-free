@@ -805,6 +805,13 @@ export function formatQwenUserFacingError(code, details) {
     || d.includes("allocated quota")
     || d.includes("token-limit")
     || d.includes("insufficient quota")
+    || d.includes("daily limit")
+    || d.includes("free tier")
+    || d.includes("guest chat limit")
+    || d.includes("reached the guest")
+    || d.includes("out_of_limit")
+    || d.includes("вы достигли дневного лимита")
+    || d.includes("достигли лимита")
   ) {
     return (
       "Qwen отклонил этот запрос по quota/token-limit.\n\n" +
