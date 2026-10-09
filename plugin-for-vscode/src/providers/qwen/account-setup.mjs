@@ -76,7 +76,9 @@ export async function addAccountInteractive() {
   return id;
 }
 
-// Перелогин аккаунта с истекшим токеном: тот же flow, профиль переиспользуется.
+// Перелогин аккаунта с истекшим токеном: сначала пытаемся автологин из
+// logins.txt (headless) для ВСЕХ мёртвых аккаунтов; оставшиеся без пароля
+// предлагаем перелогинить вручную.
 export async function reloginAccountInteractive() {
   const accounts = loadAccounts();
   const invalids = accounts.filter((a) => a.invalid);
@@ -86,18 +88,57 @@ export async function reloginAccountInteractive() {
     return;
   }
 
-  console.log("\nАккаунты с истекшим токеном:");
-  invalids.forEach((a, idx) => {
+  // --- Автологин из logins.txt (batch, headless) ---
+  const { loadQwenLogins, resolveQwenAutoLogin, autoLoginQwenAccount } = await import("./auto-login.mjs");
+  const logins = loadQwenLogins();
+  let autoOk = 0;
+  let autoFail = 0;
+  const manualLeft = [];
+
+  if (logins && logins.size) {
+    console.log(`\n🤖 Пытаюсь автологин для ${invalids.length} мёртвых аккаунтов из logins.txt...`);
+    for (const acc of invalids) {
+      const plan = resolveQwenAutoLogin({ account: acc, logins, enabled: true });
+      if (!plan.allowed) {
+        manualLeft.push(acc);
+        continue;
+      }
+      try {
+        await autoLoginQwenAccount(acc, { headless: true });
+        autoOk++;
+        console.log(`  ✅ ${acc.id} (${acc.label || plan.email}): автологин успешен`);
+      } catch (err) {
+        autoFail++;
+        manualLeft.push(acc);
+        console.log(`  ⚠️ ${acc.id} (${acc.label || plan.email}): автологин не прошёл (${err?.message?.slice(0, 80)})`);
+      }
+    }
+    console.log(`\nИтог автологина: ✅ ${autoOk} успех, ⚠️ ${autoFail} неудач.`);
+  } else {
+    console.log("\nℹ️ logins.txt пуст или отсутствует — пропускаю автологин.");
+    manualLeft.push(...invalids);
+  }
+
+  // --- Ручной перелогин для оставшихся ---
+  if (!manualLeft.length) {
+    console.log("Все аккаунты восстановлены автоматически.");
+    await prompt("Нажмите ENTER чтобы вернуться в меню...");
+    return;
+  }
+
+  console.log("\nАккаунты, требующие ручного входа:");
+  manualLeft.forEach((a, idx) => {
     const label = a.label ? ` (${a.label})` : "";
     console.log(`${idx + 1} - ${a.id}${label}`);
   });
-  const choice = await prompt("Выберите номер аккаунта для повторного входа: ");
+  const choice = await prompt("Выберите номер аккаунта для ручного входа (Enter = пропустить): ");
+  if (!choice) return;
   const num = parseInt(choice, 10);
-  if (isNaN(num) || num < 1 || num > invalids.length) {
+  if (isNaN(num) || num < 1 || num > manualLeft.length) {
     console.log("Неверный выбор.");
     return;
   }
-  const account = invalids[num - 1];
+  const account = manualLeft[num - 1];
 
   printDivider();
   console.log(`Повторная авторизация для ${account.id}${account.label ? ` (${account.label})` : ""}`);
@@ -112,8 +153,6 @@ export async function reloginAccountInteractive() {
     cookieHeader: result.cookieHeader,
     userId: result.userId,
   });
-  // Обновляем метку: перелогин могли сделать ДРУГОЙ почтой в тот же слот
-  // (инцидент 2026-09-25). Текущая показана — Enter оставляет как есть.
   const newLabel = await prompt(`Почта для метки (сейчас: ${account.label || "нет"}; Enter = оставить): `);
   if (newLabel) setAccountLabel(account.id, newLabel);
   console.log(`Токен обновлён для ${account.id}`);
