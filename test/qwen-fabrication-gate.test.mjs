@@ -52,4 +52,23 @@ describe("makeToolFabricationGate", () => {
     // Слова за пределами окна детекции не считаются фабрикацией начала ответа
     assert.equal(gate.fabricated(), false);
   });
+
+  it("ловит RU daily limit «Вы достигли дневного лимита»", () => {
+    const gate = makeToolFabricationGate();
+    gate.push("Вы достигли дневного лимита для Qwen3.8-Max. Обновите подписку.");
+    assert.equal(gate.fabricated(), true);
+    assert.equal(gate.flush(), "");
+  });
+
+  it("ловит EN daily limit «reached the daily limit»", () => {
+    const gate = makeToolFabricationGate();
+    gate.push("You have reached the daily limit for free tier requests.");
+    assert.equal(gate.fabricated(), true);
+  });
+
+  it("ловит CN daily limit «您已达到每日限制»", () => {
+    const gate = makeToolFabricationGate();
+    gate.push("您已达到每日限制，请升级订阅或稍后再试。");
+    assert.equal(gate.fabricated(), true);
+  });
 });

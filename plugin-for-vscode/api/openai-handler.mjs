@@ -1820,7 +1820,7 @@ export function makeToolFabricationGate() {
 // те же слова, но ПОСЛЕ того, как проза ушла клиенту — здесь ловим ДО).
 function detectToolFabrication(text) {
   const head = String(text || "").slice(0, FABRICATION_WINDOW_CHARS);
-  return /\bdoes not exists?\b|инструмент[а-яё]*[^\n.]{0,80}(недоступн|сломан|не\s*работа|не\s+существ)|tool\s+execution\s+backend[^\n.]{0,80}недоступн|tools?\s+(are\s+)?(broken|unavailable|failing)|не\s+могу\s+(вызв?ать|использовать)\s+инструмент/i.test(head);
+  return /\bdoes not exists?\b|инструмент[а-яё]*[^\n.]{0,80}(недоступн|сломан|не\s*работа|не\s+существ)|tool\s+execution\s+backend[^\n.]{0,80}недоступн|tools?\s+(are\s+)?(broken|unavailable|failing)|не\s+могу\s+(вызв?ать|использовать)\s+инструмент|Вы\s+достигли\s+(дневного\s+)?лимита|достигли\s+лимита|daily\s+(free\s+)?limit|reached\s+(the\s+)?daily\s+limit|free\s+tier\s+(limit|exhausted)|guest\s+chat\s+limit|out[_\s]of[_\s]limit|您已达到每日限制|已达到免费额度|免费试用已用完|今日用量已达上限/i.test(head);
 }
 
 export function requestThinkingEnabled(body, mapping = null) {
