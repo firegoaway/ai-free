@@ -29,6 +29,7 @@ import {
 } from "./session-errors.mjs";
 import { getQwenBrowserProxy, resetQwenBrowserProxy } from "./browser-proxy.mjs";
 import { buildQwenCompletionPayload } from "./completion-payload.mjs";
+import { stitchTruncatedToolCalls, toolCallsBlockState } from "./tool-call-stitch.mjs";
 import { contextFileConfigForRequest, resolveQwenContextFileConfig, splitPromptForFileUpload, uploadQwenContextFiles } from "./context-file.mjs";
 import { harvestQwenChatMessage, harvestTransportFailedCompletion } from "./harvest.mjs";
 import { waitForQwenCompletionSlot, createQwenPunishError, qwenAntibotCooldownRemainingMs } from "./request-pacing.mjs";
@@ -282,14 +283,22 @@ export class QwenChatClient {
         chatId, prompt, parentId, thinking, search, onText, onThinking, model,
         allowNewChatRecovery, autoRetry, forceContextFile,
       });
+      // Output-лимит Qwen (~1k токенов на длинном контексте) обрывает
+      // ```tool_calls блок посреди JSON (инцидент 2026-10-23: write_file
+      // без path → вечный цикл missing required field). Авто-сшивка:
+      // continuation-ходы в тот же чат, хвост стримится в onText append-only.
+      const stitchedResult = await this.#stitchTruncatedToolCallsIfNeeded({
+        chatId, result, onText, model, thinking, search,
+      });
       providerLogger.info("provider.qwen.success", {
         operation: "completion",
         model,
-        responseChars: String(result?.text || "").length,
-        recovered: Boolean(result?.recoveredChatId),
+        responseChars: String(stitchedResult?.text || "").length,
+        recovered: Boolean(stitchedResult?.recoveredChatId),
+        stitchedToolCalls: Boolean(stitchedResult?.stitchedToolCalls),
         durationMs: Date.now() - startedAt,
       });
-      return result;
+      return stitchedResult;
     } catch (error) {
       providerLogger.error("provider.qwen.error", error, {
         operation: "completion",
@@ -298,6 +307,61 @@ export class QwenChatClient {
       });
       throw error;
     }
+  }
+
+  // Авто-сшивка tool_calls, обрезанных output-лимитом: continuation-сообщения
+  // в тот же чат (parent = последний message id) с командой «продолжи ровно с
+  // места обрыва», пока блок не закроется. Хвост каждого раунда отдаётся в
+  // onText ровно один раз (append-only, overlap дедуплицирован) — клиент
+  // видит один бесшовный блок. Continuation-раунды стримятся не напрямую:
+  // их текст проходит через overlap-слияние, только добавленный суффикс
+  // уходит наверх.
+  async #stitchTruncatedToolCallsIfNeeded({ chatId, result, onText, model, thinking, search }) {
+    const text = String(result?.text || "");
+    if (toolCallsBlockState(text).complete) return result;
+
+    let parentId = result?.lastMessageId ?? null;
+    providerLogger.warn("provider.qwen.tool_call_stitch", {
+      operation: "start",
+      chatId,
+      truncatedChars: text.length,
+    });
+
+    const stitched = await stitchTruncatedToolCalls({
+      text,
+      onText,
+      sendTurn: async ({ prompt }) => {
+        const round = await this.#completionRound({
+          chatId,
+          prompt,
+          parentId,
+          thinking: false,
+          search: false,
+          onText: null,
+          onThinking: null,
+          model,
+        });
+        if (!round?.result) return { text: "" };
+        if (round.result.lastMessageId) parentId = round.result.lastMessageId;
+        return { text: round.result.text, lastMessageId: round.result.lastMessageId };
+      },
+    });
+
+    providerLogger.warn("provider.qwen.tool_call_stitch", {
+      operation: stitched.complete ? "success" : "incomplete",
+      chatId,
+      turns: stitched.turns,
+      finalChars: String(stitched.text || "").length,
+      error: stitched.error || undefined,
+    });
+
+    return {
+      ...result,
+      text: stitched.text,
+      lastMessageId: parentId,
+      stitchedToolCalls: true,
+      toolCallStitchComplete: Boolean(stitched.complete),
+    };
   }
 
   // Внутренняя реализация complete с восстановлением через новый чат.

@@ -29,7 +29,7 @@ import { getQwenLiveCatalogOverride } from "../src/providers/qwen/model-sync.mjs
 import { DEFAULT_AUTH_FILE } from "../src/config.mjs";
 import { readSavedAuth } from "../src/auth/files.mjs";
 import { DeepSeekChatClient } from "../src/providers/deepseek/client.mjs";
-import { extractBareToolCalls, formatCompactTools, normalizeToolCallsForSchemas, parseModelToolCalls, repairToolCallJson } from "./tool-calls.mjs";
+import { closingFenceIndex, extractBareToolCalls, formatCompactTools, normalizeToolCallsForSchemas, parseModelToolCalls, repairToolCallJson } from "./tool-calls.mjs";
 import { repairToolCallJsonWithLlm } from "./tool-call-llm-repair.mjs";
 import { createThinkTagFilter, createToolErrorChipFilter, stripThinkBlocks, stripToolErrorChips } from "./think-filter.mjs";
 import { readChatGPTAuth } from "../src/providers/chatgpt/auth-files.mjs";
@@ -449,6 +449,15 @@ async function handleChatCompletions(req, res) {
           completion_ms: 0,
           text_chars: String(result?.text || "").length,
         });
+        // Квота аккаунта в тексте ответа (инцидент 2026-10-12): daily limit
+        // приходит HTTP 200 обычным контентом — рвём ход синтетической
+        // rate-limit ошибкой, чтобы сработала account-ротация (24h-кулдаун
+        // → следующий аккаунт пула), а не выдача лимита клиенту «как ответ».
+        const nonStreamQuotaError = quotaLimitErrorFromText(result?.text);
+        if (nonStreamQuotaError) {
+          logQwenTiming(nonStreamRequestId, "quota_limit_detected", { attempt: accountAttempt });
+          throw nonStreamQuotaError;
+        }
         return sendJson(res, toOpenAIResponse(modelName, result.text, body.tools));
       };
 
@@ -1346,9 +1355,19 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
             first_delta_ms: firstDeltaAt ? firstDeltaAt - startedAt : null,
           });
           // Ход закончился: отпускаем остаток буфера гейта (короткие ответы
-          // < окна детекции целиком сидят в буфере). При фабрикации flush = "".
+          // < окна детекции целиком сидят в буфере). При детекте flush = "".
           const gateTail = fabricationGate ? fabricationGate.flush() : "";
           if (gateTail) thinkFilter.push(gateTail);
+          // Квота аккаунта в стриме (инцидент 2026-10-12): не «фабрикация»,
+          // не ретрай с наддогом — ретраить тот же аккаунт бессмысленно
+          // (лимит аккаунтный). Разрываем ход синтетической rate-limit
+          // ошибкой → account-ротация (markRateLimited 24h → след. пул).
+          if (fabricationGate?.kind() === "quota") {
+            const quotaError = quotaLimitErrorFromText(fabricationGate.detectedText()) || new Error("Qwen rate limit (daily limit в контенте ответа)");
+            quotaError.code = "QWEN_RATE_LIMIT";
+            logQwenTiming(requestId, "quota_limit_detected", { attempt: attempt + 1, total_ms: elapsedMs(startedAt) });
+            throw quotaError;
+          }
           // Фабрикация «инструменты недоступны»: ход дропнут гейтом (клиент
           // не видел прозу), upstream завершён. Ретраим в новом чате с
           // контр-наддогом — до FABRICATION_MAX_RETRIES раз, потом сдаёмся
@@ -1384,6 +1403,10 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
           // Baxia punish (антибот-капча): кулдаун активен, слепой retry
           // с пересозданием чата только сильнее разгоняет скоринг.
           if (error?.code === "QWEN_ANTIBOT_PUNISH") throw error;
+          // Квота аккаунта (daily limit в контенте): silent-refresh бессмысленен
+          // (лимит аккаунтный, не auth) — выходим из attempt-цикла с lastError,
+          // чтобы сработала account-ротация (throw улетел бы мимо неё клиенту).
+          if (error?.code === "QWEN_RATE_LIMIT") break;
           if (clientSawText || attempt >= 1 || typeof refreshClient !== "function") throw error;
           logQwenTiming(requestId, "retry_before_first_delta", {
             attempt: attempt + 1,
@@ -1788,39 +1811,78 @@ export function toolRefresherBlock({ tools, messageCount, promptTailGapChars = 0
 const FABRICATION_WINDOW_CHARS = 500;
 export function makeToolFabricationGate() {
   let buffered = "";
-  let decision = null; // null = собираем, false = пропустить, true = фабрикация
+  let detected = ""; // снимок буфера на момент детекта (flush буфер чистит)
+  let decision = null; // null = собираем; "clear" | "fabrication" | "quota"
   return {
     push(textDelta) {
-      if (decision === true) return ""; // после детекта — полная тишина
-      if (decision === false) return textDelta; // проверено — пропускаем
+      if (decision === "fabrication" || decision === "quota") return ""; // после детекта — полная тишина
+      if (decision === "clear") return textDelta; // проверено — пропускаем
       buffered += String(textDelta || "");
+      if (detectQuotaLimitText(buffered)) {
+        decision = "quota";
+        detected = buffered;
+        return "";
+      }
       if (detectToolFabrication(buffered)) {
-        decision = true;
+        decision = "fabrication";
+        detected = buffered;
         return "";
       }
       if (buffered.length >= FABRICATION_WINDOW_CHARS) {
-        decision = false;
-        return buffered;
+        decision = "clear";
+        const out = buffered;
+        buffered = ""; // отдан клиенту — не дублировать во flush
+        return out;
       }
       return "";
     },
     flush() {
-      if (decision === true) return "";
+      if (decision === "fabrication" || decision === "quota") return "";
       const out = buffered;
       buffered = "";
       return out;
     },
     fabricated() {
-      return decision === true;
+      return decision === "fabrication" || decision === "quota";
+    },
+    // Почему ход дропнут: "quota" — лимит аккаунта (лечится ротацией),
+    // "fabrication" — модельный артефакт (лечится ретраем с наддогом).
+    // null — ход не дропнут (в т.ч. "clear": окно прошло, текст чист).
+    kind() {
+      return decision === "quota" || decision === "fabrication" ? decision : null;
+    },
+    // Текст, на котором сработал детект (для диагностики/синтетической ошибки).
+    detectedText() {
+      return detected;
     },
   };
 }
 
+// Квота/лимит аккаунта в НАЧАЛЕ ответа. Инцидент 2026-10-12 (телеметрия
+// run-...T14-40-43-957Z): Qwen отдаёт daily limit HTTP 200 обычной
+// SSE-дельтой (phase=answer, status=finished) — это не error-событие,
+// единственный маркер — сам текст. Живые формулировки RU/EN/CN.
+const QUOTA_LIMIT_PATTERN = /Вы\s+достигли\s+(дневного\s+)?лимита|достигли\s+лимита|daily\s+(free\s+)?limit|reached\s+(the\s+)?daily\s+limit|free\s+tier\s+(limit|exhausted)|guest\s+chat\s+limit|out[_\s]of[_\s]limit|您已达到每日限制|已达到免费额度|免费试用已用完|今日用量已达上限/i;
+
+function detectQuotaLimitText(text) {
+  return QUOTA_LIMIT_PATTERN.test(String(text || "").slice(0, FABRICATION_WINDOW_CHARS));
+}
+
+// Не-стрим путь (субагенты Hermes): текст ответа → синтетическая
+// rate-limit ошибка для account-ротации (markRateLimited → следующий пул).
+export function quotaLimitErrorFromText(text) {
+  if (!detectQuotaLimitText(text)) return null;
+  const err = new Error(`Qwen rate limit (daily limit в контенте ответа): ${String(text).slice(0, 160)}`);
+  err.code = "QWEN_RATE_LIMIT";
+  return err;
+}
+
 // Паттерны по живым формулировкам инцидентов (детектор onEnd уже ловит
 // те же слова, но ПОСЛЕ того, как проза ушла клиенту — здесь ловим ДО).
+// Квота-паттерны вынесены в QUOTA_LIMIT_PATTERN: у них другое лечение.
 function detectToolFabrication(text) {
   const head = String(text || "").slice(0, FABRICATION_WINDOW_CHARS);
-  return /\bdoes not exists?\b|инструмент[а-яё]*[^\n.]{0,80}(недоступн|сломан|не\s*работа|не\s+существ)|tool\s+execution\s+backend[^\n.]{0,80}недоступн|tools?\s+(are\s+)?(broken|unavailable|failing)|не\s+могу\s+(вызв?ать|использовать)\s+инструмент|Вы\s+достигли\s+(дневного\s+)?лимита|достигли\s+лимита|daily\s+(free\s+)?limit|reached\s+(the\s+)?daily\s+limit|free\s+tier\s+(limit|exhausted)|guest\s+chat\s+limit|out[_\s]of[_\s]limit|您已达到每日限制|已达到免费额度|免费试用已用完|今日用量已达上限/i.test(head);
+  return /\bdoes not exists?\b|инструмент[а-яё]*[^\n.]{0,80}(недоступн|сломан|не\s*работа|не\s+существ)|tool\s+execution\s+backend[^\n.]{0,80}недоступн|tools?\s+(are\s+)?(broken|unavailable|failing)|не\s+могу\s+(вызв?ать|использовать)\s+инструмент/i.test(head);
 }
 
 export function requestThinkingEnabled(body, mapping = null) {
@@ -2074,7 +2136,10 @@ export class StreamParser {
       let jsonStr = this.toolsBuffer;
       
       const firstBracket = jsonStr.indexOf("[");
-      let lastBracket = jsonStr.indexOf("```");
+      // Закрывающий fence — ПОСЛЕДНИЙ ``` с пробельным хвостом: внутри
+      // content бывают вложенные markdown-фенсы (инцидент 2026-10-23),
+      // первый-match рвал JSON посередине и терял хвостовые ключи (path).
+      let lastBracket = closingFenceIndex(jsonStr);
       if (lastBracket !== -1) {
         jsonStr = jsonStr.slice(0, lastBracket);
         lastBracket = jsonStr.lastIndexOf("]");
@@ -2101,6 +2166,34 @@ export class StreamParser {
       // ключ "arguments", обрезанный блок, мусор Reasoner'а.
       const parsed = repairToolCallJson(jsonStr);
       let calls = parsed ? (Array.isArray(parsed) ? parsed : [parsed]).flat(Infinity) : [];
+
+      // GUARD (инцидент 2026-10-23): output-лимит Qwen (~1k токенов на
+      // длинном контексте) обрывает блок посреди content; ремонт JSON
+      // «спасает» вызов БЕЗ хвостовых required-полей (path шёл после
+      // content) → Hermes отвечает missing required field → модель
+      // повторяет тот же oversized-вызов → вечный цикл guardrail.
+      // Такой калеченный вызов НЕ отправляем — возвращаем модели явную
+      // инструкцию дробить полезную нагрузку.
+      // toolsBuffer хранит блок БЕЗ заголовка ```tool_calls (парсер его
+      // срезает). Закрывающий fence = ПОСЛЕДНИЙ ``` с пробельным хвостом
+      // (внутренние markdown-фенсы в content не считаются).
+      const fenceClosed = closingFenceIndex(String(this.toolsBuffer || "")) !== -1;
+      if (!fenceClosed && calls.length) {
+        const check = normalizeToolCallsForSchemas(calls, this.tools);
+        if (check.errors.length) {
+          const missingList = check.errors
+            .map((e) => `${e.name}: ${e.missing.join(", ")}`)
+            .join("; ");
+          console.warn(`[API] Tool call truncated by output token limit (missing: ${missingList}) — refusing crippled call, asking model to split`);
+          compatLogger.warn("api.tool_call.truncated_guard", { missing: missingList });
+          this.sendChunk({
+            content: `\n[Tool call truncated by the output token limit — required fields were cut off (${missingList}). The call was NOT executed. Re-emit the tool call with a SMALLER payload: put short fields like path FIRST in the arguments object, and split large content into multiple sequential calls (write the first part, then append/patch the rest). Never repeat the identical oversized call.]`,
+          });
+          this.sendTerminalChunk("stop");
+          return;
+        }
+      }
+
       let sent = calls.length ? this.sendToolCalls(calls) : 0;
       if (sent > 0) {
         console.log(`[API] Parsed streaming tool calls: ${sent}`);

@@ -60,12 +60,30 @@ export function normalizeToolCallsForSchemas(calls, tools = []) {
   return { calls: normalizedCalls, errors };
 }
 
-function extractToolCallsBlock(source) {
-  const fence = source.match(/```tool_calls\s*([\s\S]*?)```/i);
-  if (!fence) return null;
+// Позиция закрывающего фенса tool_calls-блока: последний ``` с пробельным
+// хвостом. Внутренние markdown-фенсы (код-блоки в content) закрывающими
+// не считаются — иначе JSON рвётся посередине (инцидент 2026-10-23).
+export function closingFenceIndex(source) {
+  const fence = source.lastIndexOf("```");
+  if (fence === -1) return -1;
+  return /^\s*$/.test(source.slice(fence + 3)) ? fence : -1;
+}
 
-  const blockStart = fence.index ?? 0;
-  const raw = fence[1].trim();
+function extractToolCallsBlock(source) {
+  const headerIdx = source.search(/```tool_calls/i);
+  if (headerIdx === -1) return null;
+  const blockStart = headerIdx;
+  // Закрывающий fence — ПОСЛЕДНИЙ ``` с пробельным хвостом: внутри content
+  // бывают вложенные markdown-фенсы (инцидент 2026-10-23), не жадный
+  // first-match, а хвостовой. До Connection: закрывающий = последний ``` в
+  // сообщении, после которого нет значимого текста.
+  const close = closingFenceIndex(source);
+  if (close === -1 || close <= blockStart) {
+    // Блок не закрыт: берём всё до конца — ремонт-лапка разберётся.
+    const raw = source.slice(source.indexOf("\n", blockStart) + 1).trim();
+    return { start: blockStart, json: raw };
+  }
+  const raw = source.slice(source.indexOf("\n", blockStart) + 1, close).trim();
   const firstArray = raw.indexOf("[");
   const lastArray = raw.lastIndexOf("]");
   if (firstArray >= 0 && lastArray >= firstArray) {
