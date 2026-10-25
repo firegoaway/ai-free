@@ -1313,6 +1313,11 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
               model,
               forceContextFile,
               onText: onDelta,
+              // Thinking-дельты (phase:"think") → parser.onThinking →
+              // SSE reasoning_content. Фабрикация-гейт и фильтры <think>
+              // тут не нужны: это отдельный канал, черновики JSON из
+              // reasoning не попадают в content/toolsBuffer.
+              onThinking: (t) => parser.onThinking(t),
             }),
             onDelta: (textDelta) => {
               if (!sawDelta) {
@@ -1904,13 +1909,15 @@ export function requestThinkingEnabled(body, mapping = null) {
 // Политика: без инструментов и на ранних ходах думаем как обычно; на
 // tool-ходах глубже N сообщений гасим thinking — grind не требует
 // длинных рассуждений. Отключается QWEN_ADAPTIVE_THINKING=off, порог —
-// QWEN_ADAPTIVE_THINKING_DEPTH (по умолчанию 20 сообщений).
+// QWEN_ADAPTIVE_THINKING_DEPTH (по умолчанию 200 сообщений; поднят с 20
+// 25.10 — с эмуляцией reasoning_content-канала thinking стал виден и
+// полезен на глубоких циклах, а Planning/делегирование без него деградирует).
 export function resolveAdaptiveThinking({ thinking, toolCount, messageCount, env = process.env } = {}) {
   if (!thinking) return false;
   if (String(env.QWEN_ADAPTIVE_THINKING || "").trim().toLowerCase() === "off") return true;
   if (!toolCount) return true;
   const configured = Number.parseInt(env.QWEN_ADAPTIVE_THINKING_DEPTH || "", 10);
-  const minMessages = configured > 0 ? configured : 20;
+  const minMessages = configured > 0 ? configured : 200;
   if (messageCount > minMessages) {
     console.log(`[API] qwen adaptive thinking: tool loop depth ${messageCount} > ${minMessages} — thinking off for this turn`);
     return false;
@@ -2023,6 +2030,20 @@ export class StreamParser {
     this.tools = tools;
     this.outputCount = 0;
     this.rawText = "";
+  }
+
+  // Thinking-канал (Qwen phase:"think" → OpenAI reasoning_content): Hermes
+  // рендерит эти дельты как Reasoning-блок, как с нативными reasoning-
+  // провайдерами (GLM через z.ai). Текст идёт ОТДЕЛЬНЫМ delta-полем и не
+  // попадает в content/toolsBuffer — черновики tool-call JSON внутри
+  // reasoning не могут стать ложными вызовами.
+  onThinking(textDelta) {
+    if (!textDelta) return;
+    if (this.first) {
+      this.sendChunk({ role: "assistant" }, true);
+      this.first = false;
+    }
+    this.sendChunk({ reasoning_content: textDelta });
   }
 
   onText(textDelta) {
