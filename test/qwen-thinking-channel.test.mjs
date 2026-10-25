@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
 import { Writable } from "node:stream";
 
-import { StreamParser, resolveAdaptiveThinking } from "../api/openai-handler.mjs";
+import { StreamParser, resolveAdaptiveThinking, buildPromptFromChatBody } from "../api/openai-handler.mjs";
 
 // ═══════════════════════════════════════════════════════════════
 // Эмуляция thinking-канала: Qwen phase:"think" → delta.reasoning_content
@@ -109,5 +109,28 @@ describe("adaptive thinking default depth 200", () => {
   it("env override still wins", () => {
     assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 250, env: { QWEN_ADAPTIVE_THINKING_DEPTH: "300" } }), true);
     assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 25, env: { QWEN_ADAPTIVE_THINKING: "off" } }), true);
+  });
+});
+
+describe("tool instructions: thinking home + delegation rule", () => {
+  it("tells the model that mid-task analysis belongs in thinking, not prose", () => {
+    const prompt = buildPromptFromChatBody(
+      { messages: [{ role: "user", content: "hi" }], tools: [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: {} } } }] },
+      "qwen3.8-max",
+      { provider: "qwen", model: "qwen3.8-max" },
+    );
+    assert.match(prompt, /belong in your THINKING channel/i, "thinking is the home for mid-task analysis");
+    assert.match(prompt, /think as much as you need/i, "encourages using thinking freely");
+  });
+
+  it("encourages delegating parallelizable subtasks when a delegation tool exists", () => {
+    const prompt = buildPromptFromChatBody(
+      { messages: [{ role: "user", content: "hi" }], tools: [{ type: "function", function: { name: "delegate_task", parameters: { type: "object", properties: {} } } }] },
+      "qwen3.8-max",
+      { provider: "qwen", model: "qwen3.8-max" },
+    );
+    assert.match(prompt, /delegate/i, "delegation rule present");
+    assert.match(prompt, /independent parallelizable subtasks/i, "scoped to parallelizable work");
+    assert.match(prompt, /keep decisions and file writes to yourself/i, "guard against over-delegation");
   });
 });
