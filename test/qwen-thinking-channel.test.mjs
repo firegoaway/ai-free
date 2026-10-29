@@ -170,6 +170,15 @@ describe("fabrication gate sees chip-stripped text", () => {
     assert.equal(gate.fabricated(), true, "real fabrication prose is still detected");
   });
 
+  it("fires on 'tools not responding' phrasing (29.10 11:55 leak)", () => {
+    // Инцидент 29.10 11:55: попытка 1 «временно недоступны» поймана, но
+    // попытка 2 «система временно не отвечает на запросы» УТЕКЛА в TG —
+    // «не отвечает» не было в паттерне.
+    const gate = makeToolFabricationGate();
+    gate.push(stripToolErrorChips("К сожалению, сейчас возникли технические проблемы с инструментами — система временно не отвечает на запросы для работы с файлами."));
+    assert.equal(gate.fabricated(), true, "'не отвечает' must be caught");
+  });
+
   it("quota detection survives chip stripping", () => {
     const gate = makeToolFabricationGate();
     gate.push("Вы достигли дневного лимита");

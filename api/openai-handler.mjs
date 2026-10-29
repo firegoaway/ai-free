@@ -1907,9 +1907,11 @@ export function quotaLimitErrorFromText(text) {
 // Паттерны по живым формулировкам инцидентов (детектор onEnd уже ловит
 // те же слова, но ПОСЛЕ того, как проза ушла клиенту — здесь ловим ДО).
 // Квота-паттерны вынесены в QUOTA_LIMIT_PATTERN: у них другое лечение.
+// «не отвечает» добавлен 29.10 (утечка 11:55: «система временно не
+// отвечает на запросы» — попытка 2 прошла гейт в TG).
 function detectToolFabrication(text) {
   const head = String(text || "").slice(0, FABRICATION_WINDOW_CHARS);
-  return /\bdoes not exists?\b|инструмент[а-яё]*[^\n.]{0,80}(недоступн|сломан|не\s*работа|не\s+существ)|tool\s+execution\s+backend[^\n.]{0,80}недоступн|tools?\s+(are\s+)?(broken|unavailable|failing)|не\s+могу\s+(вызв?ать|использовать)\s+инструмент/i.test(head);
+  return /\bdoes not exists?\b|инструмент[а-яё]*[^\n.]{0,80}(недоступн|сломан|не\s*работа|не\s+существ|не\s+отвеча)|tool\s+execution\s+backend[^\n.]{0,80}недоступн|tools?\s+(are\s+)?(broken|unavailable|failing|not\s+responding)|не\s+могу\s+(вызв?ать|использовать)\s+инструмент|(система|сервис)[^\n.]{0,40}не\s+отвеча[^\n.]{0,40}(инструмент|запрос)/i.test(head);
 }
 
 export function requestThinkingEnabled(body, mapping = null) {
