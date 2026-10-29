@@ -2,7 +2,8 @@ import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
 import { Writable } from "node:stream";
 
-import { StreamParser, resolveAdaptiveThinking, buildPromptFromChatBody } from "../api/openai-handler.mjs";
+import { StreamParser, resolveAdaptiveThinking, buildPromptFromChatBody, makeToolFabricationGate } from "../api/openai-handler.mjs";
+import { stripToolErrorChips } from "../api/think-filter.mjs";
 
 // ═══════════════════════════════════════════════════════════════
 // Эмуляция thinking-канала: Qwen phase:"think" → delta.reasoning_content
@@ -103,7 +104,9 @@ describe("adaptive thinking default depth 200", () => {
   });
 
   it("still moderates extremely deep loops", () => {
-    assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 250, env: {} }), false, "depth 250 turns thinking off");
+    // 29.10: лимит снят полностью; порог возвращается только через env.
+    assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 250, env: { QWEN_ADAPTIVE_THINKING_DEPTH: "200" } }), false, "env threshold still works");
+    assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 250, env: {} }), true, "no default threshold anymore");
   });
 
   it("env override still wins", () => {
@@ -132,5 +135,44 @@ describe("tool instructions: thinking home + delegation rule", () => {
     assert.match(prompt, /delegate/i, "delegation rule present");
     assert.match(prompt, /independent parallelizable subtasks/i, "scoped to parallelizable work");
     assert.match(prompt, /keep decisions and file writes to yourself/i, "guard against over-delegation");
+  });
+});
+
+describe("thinking never disabled on deep tool loops", () => {
+  it("keeps thinking at any depth when requested (limit removed 29.10)", () => {
+    assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 500, env: {} }), true, "depth 500 keeps thinking");
+    assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 5000, env: {} }), true, "no depth disables thinking");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Инцидент 29.10: чипы «Tool X does not exists» идут ПЕРЕД валидным
+// tool_calls-блоком (телеметрия 11-24-26: «Tool web_extract does not
+// exists.…```tool_calls [...] ```»). Fabrication-гейт матчится на чипы
+// в первых 500 символах сырого текста и топит ВЕСЬ ход вместе с рабочим
+// вызовом → 3 ретрая → заглушка. Чинится: гейт получает текст ПОСЛЕ
+// чипостриги.
+// ═══════════════════════════════════════════════════════════════
+describe("fabrication gate sees chip-stripped text", () => {
+  it("does not fire on backend chips followed by a real tool_calls block", () => {
+    // Реальная цепочка: чипострига вырезает чипы, гейт видит чистый текст.
+    const gate = makeToolFabricationGate();
+    const stripped = stripToolErrorChips("Tool web_extract does not exists.Tool terminal does not exists.```tool_calls\n[]\n```");
+    const released = gate.push(stripped);
+    const tail = gate.flush();
+    assert.equal(gate.fabricated(), false, "chips + valid tool_calls must NOT be fabrication");
+    assert.match((released || "") + (tail || ""), /tool_calls/, "valid call text survives");
+  });
+
+  it("still fires on genuine fabrication prose", () => {
+    const gate = makeToolFabricationGate();
+    gate.push(stripToolErrorChips("Извини, но сейчас инструменты недоступны и не работают"));
+    assert.equal(gate.fabricated(), true, "real fabrication prose is still detected");
+  });
+
+  it("quota detection survives chip stripping", () => {
+    const gate = makeToolFabricationGate();
+    gate.push("Вы достигли дневного лимита");
+    assert.equal(gate.kind(), "quota", "quota detection unaffected");
   });
 });

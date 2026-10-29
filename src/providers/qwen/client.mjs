@@ -1469,16 +1469,28 @@ async function parseQwenStream(res, onText, debug) {
 // Рекурсивно ищет в объекте поля content / text / delta и собирает строки.
 // Возвращает первое найденное (Qwen обычно посылает по одному chunk за event).
 // Различает thinking (поле phase === "think" / type === "think") и обычный ответ.
-function extractTextRecursively(node, isThinking = false) {
+// Экспортировано для тестов (qwen-thinking-summary-phase.test.mjs).
+export function extractTextRecursively(node, isThinking = false) {
   let text = "";
   let messageId = null;
   let foundThinking = isThinking;
 
   if (!node || typeof node !== "object") return { text, messageId, isThinking: foundThinking };
 
-  // Проверка thinking phase в текущем узле.
-  if (node.phase === "think" || node.phase === "thinking" || node.type === "think") {
+  // Проверка thinking phase в текущем узле. Веб-морда Qwen (не direct API):
+  // 29.10 телеметрия — thinking приходит с phase:"thinking_summary"
+  // (thinking_format:"summary" в payload), а внутри thinking-фазы бэкенд
+  // сам гоняет СВОИ тулы (web_search, web_extractor, ...) — их события тоже
+  // не являются ответом модели, классифицируем как thinking.
+  const phase = typeof node.phase === "string" ? node.phase : "";
+  if (phase === "think" || phase === "thinking" || phase.startsWith("thinking_") ||
+      (node.type === "think" && phase !== "answer")) {
     foundThinking = true;
+  }
+  // Явная фаза ответа всегда снимает thinking-контекст (события answer
+  // после think-инструментов в том же SSE-событии).
+  if (phase === "answer") {
+    foundThinking = false;
   }
 
   // Прямые поля с текстом.
@@ -1492,9 +1504,15 @@ function extractTextRecursively(node, isThinking = false) {
   if (typeof node.message_id === "string" || typeof node.message_id === "number") messageId = node.message_id;
   if (typeof node.id === "string" && (node.role === "assistant" || node.role === "ai")) messageId = node.id;
 
-  // Рекурсия в массивы.
+  // Рекурсия в массивы. content-массивы Qwen несут строки напрямую
+  // (extra.summary_title.content: ["TITLE"]) — строки не объекты, обычная
+  // рекурсия их не видит; собираем явно.
   if (Array.isArray(node)) {
     for (const item of node) {
+      if (typeof item === "string") {
+        text += item;
+        continue;
+      }
       const sub = extractTextRecursively(item, foundThinking);
       text += sub.text;
       if (sub.messageId) messageId = sub.messageId;

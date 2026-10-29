@@ -305,14 +305,13 @@ describe("OpenAI-compatible handler", () => {
   });
 
   it("moderates thinking on deep tool loops but keeps it for analysis", () => {
-    // «Авто» Qwen пере-думает на глубоких tool-циклах (срывы 2026-09):
-    // прокси гасит thinking только там. Порог поднят с 20 до 200 (25.10)
-    // вместе с эмуляцией reasoning_content-канала — подробный тест в
-    // test/qwen-thinking-channel.test.mjs.
+    // «Авто» Qwen пере-думает на глубоких tool-циклах (срывы 2026-09).
+    // История порога: 20 → 200 (25.10) → снят полностью (29.10).
+    // Порог возвращается только через QWEN_ADAPTIVE_THINKING_DEPTH.
     assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 0, messageCount: 60, env: {} }), true, "analysis without tools keeps thinking");
     assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 5, env: {} }), true, "early tool turns keep thinking for planning");
-    assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 25, env: {} }), true, "moderate tool loop keeps thinking (threshold raised to 200)");
-    assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 250, env: {} }), false, "extremely deep tool loop turns thinking off");
+    assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 5000, env: {} }), true, "no default depth disables thinking anymore");
+    assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 250, env: { QWEN_ADAPTIVE_THINKING_DEPTH: "200" } }), false, "env threshold still works");
     assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 25, env: { QWEN_ADAPTIVE_THINKING: "off" } }), true, "policy can be disabled");
     assert.equal(resolveAdaptiveThinking({ thinking: true, toolCount: 34, messageCount: 40, env: { QWEN_ADAPTIVE_THINKING_DEPTH: "50" } }), true, "depth threshold is configurable");
     assert.equal(resolveAdaptiveThinking({ thinking: false, toolCount: 34, messageCount: 60, env: {} }), false, "thinking off stays off");

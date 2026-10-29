@@ -1248,13 +1248,30 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
   // вызовы. Фильтр вырезает think-блоки до того, как буфер увидит парсер.
   // Поверх — чипострига: ошибки бэкенда «Tool X does not exists.» утекают
   // в видимый текст и не живут в think-канале, поэтому идут вторым слоем.
-  const chipFilter = createToolErrorChipFilter({ onText: (t) => parser.onText(t) });
+  // ПОРЯДОК (инцидент 29.10 11:24): чипы могут идти ПЕРЕД валидным
+  // tool_calls-блоком; fabrication-гейт обязан видеть текст ПОСЛЕ
+  // чипостриги, иначе топит рабочий вызов → 3 ретрая → заглушка.
+  // Цепочка: thinkFilter → chipFilter → fabricationGate → parser.
+  let fabricationGate = null;
+  const chipFilter = createToolErrorChipFilter({
+    onText: (t) => {
+      if (fabricationGate && !fabricationGate.fabricated()) {
+        const released = fabricationGate.push(t);
+        if (released) {
+          clientSawText = true;
+          parser.onText(released);
+        }
+      } else {
+        parser.onText(t);
+      }
+    },
+  });
   const thinkFilter = createThinkTagFilter({ onText: (t) => chipFilter.push(t) });
   // Гейт фабрикации (инциденты 03.10 «Model claims tool failure but no tool
   // calls»): первые символы ответа копятся до отпускания клиенту; если ход
   // начинается с «инструменты недоступны» — дропаем его целиком и ретраим
   // в новом чате с контр-наддогом. До 2 попыток на запрос.
-  let fabricationGate = null;
+  // Сам объект гейта объявлен выше (chipFilter замыкается на него).
   let fabricationRetries = 0;
   const FABRICATION_MAX_RETRIES = Number(process.env.QWEN_FABRICATION_RETRIES ?? 2);
   let counterNudge = "";
@@ -1262,7 +1279,7 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
   // Инцидент 04.10 12:02: sawDelta — ТРАНСПОРТНЫЙ прогресс (heartbeat молчит,
   // ретраи скипаются). Но гейт фабрикации может проглотить весь ход: клиент
   // ничего не видел, а sawDelta=true. clientSawText — истина только когда
-  // текст реально ушёл в thinkFilter (клиенту). Именно он блокирует
+  // текст реально ушёл клиенту (парсеру). Именно он блокирует
   // ретрай/ротацию mid-stream; транспортный sawDelta — только heartbeat.
   let clientSawText = false;
   let firstDeltaAt = 0;
@@ -1330,14 +1347,12 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
                   completion_to_first_delta_ms: elapsedMs(completionStartedAt),
                 });
               }
-              // Гейт фабрикации: первые символы — через гейт; при детекте —
-              // тишина клиенту, маркер для ретрая после завершения upstream.
+              // Дельты идут в thinkFilter → chipFilter → fabricationGate →
+              // parser (гейт видит текст ПОСЛЕ чипостриги — инцидент 29.10).
+              // При детекте fabrication гейт молчит: клиент не видит прозу,
+              // ход ретраится после завершения upstream.
               if (fabricationGate && !fabricationGate.fabricated()) {
-                const released = fabricationGate.push(textDelta);
-                if (released) {
-                  thinkFilter.push(released);
-                  clientSawText = true;
-                }
+                thinkFilter.push(textDelta);
                 if (fabricationGate.fabricated()) {
                   logQwenTiming(requestId, "fabrication_detected", { attempt: attempt + 1, total_ms: elapsedMs(startedAt) });
                 }
@@ -1362,8 +1377,13 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
           });
           // Ход закончился: отпускаем остаток буфера гейта (короткие ответы
           // < окна детекции целиком сидят в буфере). При детекте flush = "".
+          // Гейт-остаток — уже чипо- и think-очищенный текст, идёт прямо
+          // в парсер (повторная фильтрация исказила бы текст).
           const gateTail = fabricationGate ? fabricationGate.flush() : "";
-          if (gateTail) thinkFilter.push(gateTail);
+          if (gateTail) {
+            clientSawText = true;
+            parser.onText(gateTail);
+          }
           // Квота аккаунта в стриме (инцидент 2026-10-12): не «фабрикация»,
           // не ретрай с наддогом — ретраить тот же аккаунт бессмысленно
           // (лимит аккаунтный). Разрываем ход синтетической rate-limit
@@ -1393,6 +1413,7 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
             // Гейт молчал весь ход; клиент ничего не получил.
             // Отдаём честную ошибку-заглушку вместо зависания.
             thinkFilter.push("[Инструменты доступны, но модель повторно ответила прозой о недоступности инструментов. Повторите запрос.]");
+            fabricationGate = null; // заглушка пошла — больше не фильтруем
           }
           lastError = null;
           break;
@@ -1904,23 +1925,20 @@ export function requestThinkingEnabled(body, mapping = null) {
   );
 }
 
-// Адаптивное мышление (солидарность прокси с агентским циклом): «Авто»-режим
-// Qwen пере-думает на глубоких tool-циклах — инциденты 2026-09: 120-220 с
-// thinking на ходах messageCount 25+, за которыми следовал «режим эссе».
-// Политика: без инструментов и на ранних ходах думаем как обычно; на
-// tool-ходах глубже N сообщений гасим thinking — grind не требует
-// длинных рассуждений. Отключается QWEN_ADAPTIVE_THINKING=off, порог —
-// QWEN_ADAPTIVE_THINKING_DEPTH (по умолчанию 200 сообщений; поднят с 20
-// 25.10 — с эмуляцией reasoning_content-канала thinking стал виден и
-// полезен на глубоких циклах, а Planning/делегирование без него деградирует).
+// Адаптивное мышление: «Авто»-режим Qwen пере-думает на глубоких tool-циклах
+// (инциденты 2026-09). История порога: 20 → 200 (25.10, вместе с эмуляцией
+// reasoning_content) → снят полностью (29.10, просьба пользователя: с
+// thinking-каналом долгие размышления видны и полезны, гасить их по счётчику
+// сообщений больше не нужно). QWEN_ADAPTIVE_THINKING_DEPTH=N возвращает
+// пороговое поведение, QWEN_ADAPTIVE_THINKING=off — форсирует thinking.
 export function resolveAdaptiveThinking({ thinking, toolCount, messageCount, env = process.env } = {}) {
   if (!thinking) return false;
   if (String(env.QWEN_ADAPTIVE_THINKING || "").trim().toLowerCase() === "off") return true;
   if (!toolCount) return true;
   const configured = Number.parseInt(env.QWEN_ADAPTIVE_THINKING_DEPTH || "", 10);
-  const minMessages = configured > 0 ? configured : 200;
-  if (messageCount > minMessages) {
-    console.log(`[API] qwen adaptive thinking: tool loop depth ${messageCount} > ${minMessages} — thinking off for this turn`);
+  if (!(configured > 0)) return true; // лимит снят: thinking на любой глубине
+  if (messageCount > configured) {
+    console.log(`[API] qwen adaptive thinking: tool loop depth ${messageCount} > ${configured} — thinking off for this turn`);
     return false;
   }
   return true;
