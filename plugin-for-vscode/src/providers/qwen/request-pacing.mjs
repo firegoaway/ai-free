@@ -252,6 +252,33 @@ export async function waitForQwenCompletionSlot(inject = {}) {
         : () => Date.now();
   const sleep = inject.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
 
+  // Punish-wait (инцидент 06.11 18:00): Hermes ретраил запрос во время
+  // пулевого кулдауна, и каждый ретрай мгновенно получал stream_error
+  // «Cooldown ~216s» — тающий остаток, отданный ошибкой в лицо (4 подряд
+  // в TG). Если остаток кулдауна укладывается в бюджет ожидания
+  // QWEN_PUNISH_WAIT_MAX_MS (по умолчанию 300с — ровно пулевый кулдаун),
+  // ЖДЁМ до конца и продолжаем как ни в чём не бывало. Ошибку бросаем
+  // только если остаток дольше бюджета (эскалация 600с+ — ждать весь
+  // ход бессмысленно, клиент должен знать).
+  const waitBudgetMs = numEnv("QWEN_PUNISH_WAIT_MAX_MS", 300_000);
+  let punishWaitedMs = 0;
+  let cooldownLeft = qwenAntibotCooldownRemainingMs(nowFn(), inject.accountId);
+  if (cooldownLeft > 0) {
+    if (cooldownLeft > waitBudgetMs) {
+      await assertNoQwenAntibotCooldown(nowFn(), inject.accountId); // бросит с человеческим текстом
+    }
+    console.log(`[qwen-proxy] antibot cooldown active (${Math.round(cooldownLeft / 1000)}s) — waiting it out instead of failing (budget ${Math.round(waitBudgetMs / 1000)}s)`);
+    while (cooldownLeft > 0) {
+      const chunk = Math.min(cooldownLeft, 5_000);
+      const before = nowFn();
+      await sleep(chunk);
+      punishWaitedMs += Math.max(0, nowFn() - before);
+      cooldownLeft = qwenAntibotCooldownRemainingMs(nowFn(), inject.accountId);
+      // Ручное решение капчи в окне (clearQwenPunishCooldown) подхватится
+      // здесь мгновенно: остаток обнулится раньше таймера.
+    }
+  }
+
   await assertNoQwenAntibotCooldown(nowFn(), inject.accountId);
 
   const minInterval = numEnv(
@@ -271,5 +298,5 @@ export async function waitForQwenCompletionSlot(inject = {}) {
   const waitMs = sendAt - start;
   lastCompletionAt = sendAt + minInterval;
   if (waitMs > 0) await sleep(waitMs);
-  return waitMs;
+  return waitMs + punishWaitedMs;
 }
