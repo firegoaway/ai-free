@@ -1261,9 +1261,14 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
           clientSawText = true;
           parser.onText(released);
         }
-      } else {
+      } else if (!fabricationGate) {
         parser.onText(t);
       }
+    },
+    // 07.11 шторм-детект: каждый вырезанный чип репортится гейту.
+    // 4+ без доставленного tool_calls → "storm" → ретрай с наддогом.
+    onChip: () => {
+      if (fabricationGate) fabricationGate.registerChip();
     },
   });
   const thinkFilter = createThinkTagFilter({ onText: (t) => chipFilter.push(t) });
@@ -1400,7 +1405,13 @@ export async function handleQwenStream(client, chatId, prompt, modelName, model,
           // и пропускаем ответ как есть (последняя попытка без гейта).
           if (fabricationGate?.fabricated() && fabricationRetries < FABRICATION_MAX_RETRIES) {
             fabricationRetries += 1;
-            counterNudge = `\n\n---\n[SYSTEM]: Your previous reply claimed tools are unavailable. That was FALSE — tools are live. Do NOT write any explanation about tools. Reply ONLY with the \`\`\`tool_calls\`\`\` block (JSON array) for the next action, or the final answer if the task is complete.`;
+            // Наддог зависит от причины: fabrication — «не выдумывай отказ»,
+            // storm — «бэкенд отвергает нативные вызовы; тулы живут
+            // в markdown-блоке ответа, не в thinking» (07.11, субагент 29-52:
+            // 15 чипов → ложный «Задача выполнена»).
+            counterNudge = fabricationGate.kind() === "storm"
+              ? `\n\n---\n[SYSTEM]: Your previous turn tried to call tools NATIVELY and the backend rejected every attempt («Tool X does not exists» x${fabricationGate.detectedText().match(/(\d+)/)?.[1] ?? "4+"}). Native tool calls DO NOT work here. To call a tool, output a \`\`\`tool_calls\`\`\` markdown block (JSON array) as your ENTIRE visible reply. Never call tools during thinking. If the task is complete, output the final report — but NEVER claim work was done unless the tool calls actually succeeded in this conversation.`
+              : `\n\n---\n[SYSTEM]: Your previous reply claimed tools are unavailable. That was FALSE — tools are live. Do NOT write any explanation about tools. Reply ONLY with the \`\`\`tool_calls\`\`\` block (JSON array) for the next action, or the final answer if the task is complete.`;
             logQwenTiming(requestId, "fabrication_retry", { attempt: fabricationRetries, total_ms: elapsedMs(startedAt) });
             activeChatId = null; // новый чат — старое дерево с фабрикацией не переиспользуем
             forceContextFile = false;
@@ -1839,8 +1850,25 @@ const FABRICATION_WINDOW_CHARS = 500;
 export function makeToolFabricationGate() {
   let buffered = "";
   let detected = ""; // снимок буфера на момент детекта (flush буфер чистит)
-  let decision = null; // null = собираем; "clear" | "fabrication" | "quota"
+  let decision = null; // null = собираем; "clear" | "fabrication" | "quota" | "storm"
+  let chipCount = 0; // 07.11: шторм-детект — чипы считает чипострига (onChip)
   return {
+    registerChip() {
+      // 07.11 (субагент 29-52): 15 чипов подряд, бэкенд отвергал попытки
+      // звать тулы; модель сдалась и написала ЛОЖНЫЙ отчёт «Задача
+      // выполнена». 4+ чипов без отпущенного tool_calls = шторм: ход
+      // дропаем и ретраим с наддогом «тулы — markdown-блоком в ответе,
+      // не в thinking». Если в буфере уже есть tool_calls-блок (валидный
+      // вызов доехал в этом же ходе — случай 29.10 11:53) — чипы
+      // косметика, ход не трогаем.
+      if (decision === "clear") return;
+      if (buffered.includes("```tool_calls")) return;
+      chipCount += 1;
+      if (chipCount >= 4 && decision === null) {
+        decision = "storm";
+        detected = `chip storm: ${chipCount} backend «Tool X does not exists» rejections without a delivered tool call`;
+      }
+    },
     push(textDelta) {
       if (decision === "fabrication" || decision === "quota") return ""; // после детекта — полная тишина
       if (decision === "clear") return textDelta; // проверено — пропускаем
@@ -1864,19 +1892,25 @@ export function makeToolFabricationGate() {
       return "";
     },
     flush() {
-      if (decision === "fabrication" || decision === "quota") return "";
+      // Страховка: шторм прилип, но в буфере доехал валидный tool_calls —
+      // ход жив, отпускаем (ложный шторм хуже пропущенного).
+      if (decision === "storm" && buffered.includes("```tool_calls")) {
+        decision = "clear";
+      }
+      if (decision === "fabrication" || decision === "quota" || decision === "storm") return "";
       const out = buffered;
       buffered = "";
       return out;
     },
     fabricated() {
-      return decision === "fabrication" || decision === "quota";
+      return decision === "fabrication" || decision === "quota" || decision === "storm";
     },
     // Почему ход дропнут: "quota" — лимит аккаунта (лечится ротацией),
-    // "fabrication" — модельный артефакт (лечится ретраем с наддогом).
+    // "fabrication" — модельный артефакт (лечится ретраем с наддогом),
+    // "storm" — чип-шторм бэкенда (ретраем с наддогом про markdown-тулы).
     // null — ход не дропнут (в т.ч. "clear": окно прошло, текст чист).
     kind() {
-      return decision === "quota" || decision === "fabrication" ? decision : null;
+      return decision === "quota" || decision === "fabrication" || decision === "storm" ? decision : null;
     },
     // Текст, на котором сработал детект (для диагностики/синтетической ошибки).
     detectedText() {

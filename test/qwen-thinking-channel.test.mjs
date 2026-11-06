@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { Writable } from "node:stream";
 
 import { StreamParser, resolveAdaptiveThinking, buildPromptFromChatBody, makeToolFabricationGate } from "../api/openai-handler.mjs";
-import { stripToolErrorChips } from "../api/think-filter.mjs";
+import { stripToolErrorChips, createToolErrorChipFilter } from "../api/think-filter.mjs";
 
 // ═══════════════════════════════════════════════════════════════
 // Эмуляция thinking-канала: Qwen phase:"think" → delta.reasoning_content
@@ -183,5 +183,44 @@ describe("fabrication gate sees chip-stripped text", () => {
     const gate = makeToolFabricationGate();
     gate.push("Вы достигли дневного лимита");
     assert.equal(gate.kind(), "quota", "quota detection unaffected");
+  });
+
+  it("chip storm (4+ backend chips, no tool call) drops the turn as 'storm'", () => {
+    // Инцидент 07.11: субагент 29-52 получил 15 чипов «Tool X does not
+    // exists» (бэкенд отвергал его попытки звать тулы в thinking-фазе),
+    // после чего модель написала ЛОЖНЫЙ отчёт «Задача выполнена».
+    // Шторм чипов = модель бьётся в закрытую дверь: ход дропаем и ретраим
+    // с наддогом «зови тулы markdown-блоком в ответе, не в thinking».
+    const gate = makeToolFabricationGate();
+    gate.registerChip();
+    gate.registerChip();
+    gate.registerChip();
+    assert.equal(gate.fabricated(), false, "3 chips tolerated (11:53 case: 2 chips + valid call)");
+    gate.registerChip();
+    assert.equal(gate.fabricated(), true, "4th chip with no visible tool call = storm");
+    assert.equal(gate.kind(), "storm", "storm is a distinct kind for the retry nudge");
+  });
+
+  it("chip storm does not fire if a real tool_calls block already passed", () => {
+    // 11:53: чипы → проза → валидный tool_calls в том же ходе. Вызов
+    // сидит в буфере гейта (ход короче окна) и выходит на flush; чипы
+    // до/после блока — косметика, шторм не прилипает.
+    const gate = makeToolFabricationGate();
+    gate.push("```tool_calls\n[]\n```");
+    gate.registerChip();
+    gate.registerChip();
+    gate.registerChip();
+    gate.registerChip();
+    assert.equal(gate.fabricated(), false, "chips around a buffered tool_calls block are cosmetic");
+    const tail = gate.flush();
+    assert.match(tail, /tool_calls/, "valid call is delivered via flush");
+  });
+
+  it("chip filter reports stripped chips via onChip", () => {
+    let chips = 0;
+    const filter = createToolErrorChipFilter({ onText: () => {}, onChip: () => { chips += 1; } });
+    filter.push("Tool terminal does not exists.Tool web_extract does not exists.");
+    filter.flush();
+    assert.equal(chips, 2, "each stripped chip increments the counter");
   });
 });

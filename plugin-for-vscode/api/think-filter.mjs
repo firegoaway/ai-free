@@ -23,6 +23,9 @@ const THINKING_COMPLETED_RE = /(?:^|\n)[ \t]*Thinking completed[ \t]*(?=\n|$)/g;
 // exists.Tool Y does not exists.Замысел: …»). Вырезаем целиком вместе с
 // обрамляющими пробелами; обычная проза про инструменты не матчится.
 const TOOL_CHIP_RE = /[ \t]*Tool[ \t]+\S{1,64}[ \t]+does[ \t]+not[ \t]+exists?[ \t]*\.?/g;
+// Глобальная копия для подсчёта (match с /g требует «свежий» regex —
+// последний lastIndex stateful).
+const TOOL_CHIP_RE_G = /[ \t]*Tool[ \t]+\S{1,64}[ \t]+does[ \t]+not[ \t]+exists?[ \t]*\.?/g;
 
 // Максимальная длина потенциального чипа-префикса, который стриминговый
 // фильтр может придержать (см. partialChipPrefixLen).
@@ -164,16 +167,26 @@ export function stripToolErrorChips(text) {
 // начала чипа («Tool rea…»), разрезанного по границе чанков. Буфер
 // ограничен CHIP_PREFIX_MAX, поэтому латентность видимого текста
 // растёт максимум на длину одного чипа и только рядом с ним.
-export function createToolErrorChipFilter({ onText = null } = {}) {
+// onChip (07.11): каждый вырезанный чип репортится наверх — шторм-детект
+// fabrication-гейта считает их (4+ без видимого tool_calls = модель бьётся
+// в закрытую дверь бэкенда, ход надо ретраить с профильным наддогом).
+export function createToolErrorChipFilter({ onText = null, onChip = null } = {}) {
   let hold = "";
 
   function emit(text) {
     if (text && typeof onText === "function") onText(text);
   }
 
+  function countChips(s) {
+    if (typeof onChip !== "function") return;
+    const n = (s.match(TOOL_CHIP_RE_G) || []).length;
+    for (let i = 0; i < n; i += 1) onChip();
+  }
+
   function process(s) {
     // Быстрая проверка: без «Tool » чипов быть не может.
     if (!/(^|[ \t\n])Tool[ \t]/.test(s)) return { out: s, hold: "" };
+    countChips(s);
     const cleaned = s.replace(TOOL_CHIP_RE, "");
     // Если в конце остался потенциальный prefix чипа — придержим его.
     const keep = partialChipPrefixLen(s);
