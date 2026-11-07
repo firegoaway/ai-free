@@ -223,4 +223,18 @@ describe("fabrication gate sees chip-stripped text", () => {
     filter.flush();
     assert.equal(chips, 2, "each stripped chip increments the counter");
   });
+
+  it("rule 14: interval reading for large files (grep first, then offset/limit ranges)", () => {
+    const prompt = buildPromptFromChatBody(
+      { messages: [{ role: "user", content: "hi" }], tools: [
+        { type: "function", function: { name: "read_file", parameters: { type: "object", properties: {} } } },
+        { type: "function", function: { name: "search_files", parameters: { type: "object", properties: {} } } },
+      ] },
+      "qwen3.8-max",
+      { provider: "qwen", model: "qwen3.8-max" },
+    );
+    assert.match(prompt, /interval reading/i, "interval reading rule present");
+    assert.match(prompt, /offset\/limit/i, "points at read_file offset/limit mechanics");
+    assert.match(prompt, /never read (?:an entire |the whole )?large file/i, "forbids swallowing large files whole");
+  });
 });
